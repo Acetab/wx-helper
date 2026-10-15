@@ -2,7 +2,8 @@
 
 面向 Windows x64、微信 4.1.15.13 的 Python 插件框架。统一入口为 `main.py`，原生桥接负责文本收发，功能以插件加载。
 
-公开模板不包含真实账号、群号、成员绑定、API key、聊天记录或运行日志。首次使用需要填写自己的本地配置；示例账号 `wxid_example_robot` 是占位符。
+
+# 本项目仅供学习，请勿用于违法行为
 
 ## 功能
 
@@ -13,14 +14,12 @@
 - `/切换人格 嘴臭|卑微|夸夸|取消`：为当前群的对话、总结和接龙点评设置表达风格。
 - 真正艾特机器人后对话，携带该成员在当前群当天此前最多十条有效发言。
 - 每天北京时间 0 点清理旧日文本；`/清空` 手动清理当前群文本。
-- 按文本长度随机等待后发送；这是发送节奏设置，不保证账号不会受到平台限制。
+- 按文本长度随机等待后发送。
 - 插件启停、重载与开发模板。
 
 ## 运行环境
 
 Windows 10/11 x64、64 位 Python（已验证 Python 3.13）、`requirements.txt` 中的依赖，以及 Microsoft Visual C++ x64 运行库。
-
-使用预编译桥接不需要 Visual Studio、Ghidra 或调试器。微信版本和核心文件 SHA256 必须符合 `native/compatibility.json`；其他版本需要重新适配。
 
 ## 首次配置
 
@@ -30,8 +29,6 @@ Windows 10/11 x64、64 位 Python（已验证 Python 3.13）、`requirements.txt
 python -m pip install -r requirements.txt
 python tools/init_config.py
 ```
-
-编辑生成的三个本地文件。这三个文件已被 Git 忽略，公开仓库只需提交对应的 `.example.json` 模板。
 
 1. `bot_config.json`：将 `wechat_account` 改为自己的机器人微信 ID。绑定保存的是账号 ID，重新登录后 PID 改变不影响选择；多开时会等待指定账号，不改用其他账号。
 2. `members_config.json`：在 `groups` 中添加自己要启用的群 ID，成员列表可以为空：
@@ -93,23 +90,3 @@ tools/                   本地配置初始化和发布前检查
 *.example.json           可提交的脱敏配置模板
 ```
 
-运行后才会生成 `.runtime/`、`logs/` 和本地配置。它们不属于公开源代码。
-
-## 测试与原生编译
-
-```powershell
-python -B -m unittest discover -s tests -q
-python -B tools/check_publication.py
-```
-
-单元测试使用虚构身份、内存后端和模拟模型响应，不向真实微信发送消息。
-
-发布检查面向待上传的干净副本；测试生成的 `.runtime/`、缓存和日志应在打包前排除，检查工具会将它们列为待清理项。
-
-需要重新编译 DLL 时，先进入 MSVC 的 x64 开发者环境，再执行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File native/build_bridges.ps1
-```
-
-该脚本只编译桥接组件，不修改系统安全设置。正常运行不需要执行编译步骤。
