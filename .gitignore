@@ -1,0 +1,46 @@
+# Local account, group and model settings
+/bot_config.json
+/members_config.json
+/llm_config.json
+.env
+.env.*
+!.env.example
+private_markers.*
+
+# Runtime data, messages, logs and caches
+.runtime/
+logs/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.log.*
+*.dmp
+*.bak
+*.tmp
+.venv/
+venv/
+
+# Build output; only the two required bridges are distributed
+native/.build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.exe
+*.dll
+!native/build/selftest_bridge.dll
+!native/build_text/text_bridge.dll
+*.zip
+*.7z
+*.rar
+dist/
+
+# Editor and desktop metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
