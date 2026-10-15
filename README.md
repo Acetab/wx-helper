@@ -87,8 +87,7 @@ main.py                  统一入口
 wxbot_framework/         框架、成员目录、消息缓存、大模型客户端
 plugins/                 各功能插件和开发模板
 native/                  原生桥接源码、两个必要 DLL、版本指纹和 MinHook
-tests/                   不连接微信或真实模型的本地测试
+tests/                  本地测试
 tools/                   本地配置初始化和发布前检查
-*.example.json           可提交的脱敏配置模板
 ```
 
