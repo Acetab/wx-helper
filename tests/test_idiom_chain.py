@@ -1,4 +1,4 @@
-"""验证独立接龙、合并首答和发送失败时的状态，使用内存上下文。"""
+"""验证全群共享接龙、普通聊天不入局、抢答与失败时的状态，使用内存上下文。"""
 import logging
 import time
 import unittest
@@ -24,7 +24,7 @@ class JSONClient:
 
 class Context:
     def __init__(self):
-        self.config = {"member_names": {ROOM: {A: "小明"}}}
+        self.config = {"member_names": {ROOM: {A: "小明", B: "小红"}}}
         self.llm = JSONClient({"idiom": "一心一意"})
         self.logger = logging.getLogger("IdiomTests")
         self.sent = []
@@ -54,9 +54,11 @@ class IdiomPluginTests(unittest.TestCase):
         self.plugin = Plugin()
         self.plugin.on_load(self.ctx)
 
-    def send(self, text, sender=A, room=ROOM, *, session="one", received_at=None, is_self=False, is_group=True):
+    def send(self, text, sender=A, room=ROOM, *, session="one", received_at=None, is_self=False,
+             is_group=True, at_self=False):
         message = Message(text, room, sender_id=sender, session_id=session, is_group=is_group,
-                          is_self=is_self, received_at=time.monotonic() if received_at is None else received_at)
+                          is_self=is_self, received_at=time.monotonic() if received_at is None else received_at,
+                          data={"is_at_self": at_self})
         self.plugin.on_message(message, self.ctx)
         return message
 
@@ -64,60 +66,86 @@ class IdiomPluginTests(unittest.TestCase):
         self.send("成语接龙")
         self.ctx.llm.result = {"is_idiom": True, "reason": "常见成语", "next_idiom": "发扬光大"}
 
-    def test_two_players_are_independent_and_use_member_names(self):
+    def test_start_reply_explains_rule(self):
+        self.send("成语接龙")
+        self.assertEqual(len(self.ctx.sent), 1)
+        self.assertIn("一心一意", self.ctx.sent[-1][1])
+        self.assertIn("四字成语", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
+
+    def test_players_share_one_chain_and_inherit_progress(self):
         self.start()
-        # 两个答案都在机器人第一次回复之前到达：B 仍应从开场词接。
-        b_received = time.monotonic()
         self.send("意气风发", A)
-        self.send("意气风发", B, received_at=b_received)
-        game = self.plugin.games[ROOM]
-        self.assertEqual(game.players[A].current, "发扬光大")
-        self.assertEqual(game.players[B].current, "发扬光大")
-        self.assertEqual(self.ctx.sent[-2][2:], (A, "小明"))
-        self.assertEqual(self.ctx.sent[-1][2:], (B, None))
+        self.assertEqual(self.ctx.sent[-1][2:], (A, "小明"))
+        self.assertIn("发扬光大", self.ctx.sent[-1][1])
+        # 第二位玩家接着上一位玩家报出的“大”继续，而不是回到开场成语。
         self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", A)
-        self.assertEqual(game.players[A].current, "方兴未艾")
-        self.assertEqual(game.players[B].current, "发扬光大")
+        self.send("大大方方", B)
+        self.assertEqual(self.ctx.sent[-1][2:], (B, "小红"))
+        self.assertIn("大大方方", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.assertEqual(self.plugin.games[ROOM].chain.used[-2:], ("大大方方", "方兴未艾"))
+
+    def test_plain_chat_is_ignored_while_game_runs(self):
+        self.start()
+        game = self.plugin.games[ROOM]
+        count = len(self.ctx.sent)
+        for text in ("晚上吃啥", "哈哈哈哈", "你们先聊", "?", "大" * 5):
+            self.send(text, B)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(game.chain.current, "一心一意")
+        self.assertEqual(game.chain.used, ("一心一意",))
+
+    def test_wrong_first_character_is_treated_as_plain_chat(self):
+        self.start()
+        count = len(self.ctx.sent)
+        self.send("异想天开", B)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
+
+    def test_correct_prefix_but_not_idiom_reports_failure(self):
+        self.start()
+        self.ctx.llm.result = {"is_idiom": False, "reason": "这不是成语", "next_idiom": ""}
+        self.send("意料之外", B)
+        self.assertIn("接龙失败", self.ctx.sent[-1][1])
+        self.assertEqual(self.ctx.sent[-1][2:], (B, "小红"))
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
+
+    def test_only_first_answer_of_a_round_counts(self):
+        self.start()
+        arrived = time.monotonic()
+        self.send("意气风发", A, received_at=arrived)
+        count = len(self.ctx.sent)
+        self.send("大大方方", B, received_at=arrived + 0.00000001)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+        self.ctx.llm.result["next_idiom"] = "方兴未艾"
+        self.send("大大方方", B)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+
+    def test_merged_command_keeps_the_same_shared_chain(self):
+        self.start()
+        self.send("意气风发", A)
+        self.send("合并接龙")
+        self.assertIn("发扬光大", self.ctx.sent[-1][1])
+        self.ctx.llm.result["next_idiom"] = "方兴未艾"
+        self.send("大大方方", B)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+
+    def test_status_command_reports_current_word_without_starting_over(self):
+        self.start()
+        self.send("意气风发", A)
+        opening = self.plugin.games[ROOM].opening
+        self.ctx.llm.result = {"idiom": "自相矛盾"}
+        self.send("成语接龙", B)
+        self.assertIn("发扬光大", self.ctx.sent[-1][1])
+        self.assertIn("大", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].opening, opening)
 
     def test_groups_do_not_share_game(self):
         self.start()
         self.send("意气风发", room="87654321@chatroom")
         self.assertEqual(len(self.ctx.sent), 1)
-
-    def test_bad_answer_keeps_current_question(self):
-        self.start()
-        self.send("异想天开")
-        self.assertEqual(self.plugin.games[ROOM].players[A].current, "一心一意")
-        self.assertIn("接龙失败", self.ctx.sent[-1][1])
-
-    def test_merged_mode_uses_latest_word_and_only_first_received_answer(self):
-        self.start()
-        self.send("意气风发")
-        self.send("合并接龙")
-        game = self.plugin.games[ROOM]
-        self.assertEqual(game.shared.current, "发扬光大")
-        self.assertEqual(game.players, {})
-        arrived = time.monotonic()
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", A, received_at=arrived)
-        count = len(self.ctx.sent)
-        self.send("大大方方", B, received_at=arrived + 0.00000001)
-        self.assertEqual(len(self.ctx.sent), count)
-        self.assertIsNone(self.ctx.sent[-1][2])
-        self.assertEqual(game.shared.current, "方兴未艾")
-
-    def test_failed_merged_answer_still_consumes_round(self):
-        self.start()
-        self.send("合并接龙")
-        arrived = time.monotonic()
-        self.send("异想天开", received_at=arrived)
-        count = len(self.ctx.sent)
-        self.send("意气风发", B, received_at=arrived)
-        self.assertEqual(len(self.ctx.sent), count)
-        self.assertEqual(self.plugin.games[ROOM].shared.current, "一心一意")
-        self.send("意气风发", B)
-        self.assertEqual(self.plugin.games[ROOM].shared.current, "发扬光大")
 
     def test_exit_and_restart(self):
         self.start()
@@ -135,11 +163,18 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.ctx.sent, [])  # 帮助统一由知识插件处理，不重复回复。
         self.assertIn("/记忆", HELP)
         self.send("成语接龙", is_self=True)
-        self.assertEqual(self.ctx.sent[-1][1], "一心一意")
+        self.assertIn("一心一意", self.ctx.sent[-1][1])
         self.assertIn(ROOM, self.plugin.games)
         self.ctx.llm.result = {"is_idiom": True, "reason": "常见成语", "next_idiom": "发扬光大"}
         self.send("意气风发", is_self=True)
-        self.assertEqual(self.plugin.games[ROOM].players[A].current, "发扬光大")
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+
+    def test_at_self_chat_is_left_to_mention_plugin(self):
+        self.start()
+        count = len(self.ctx.sent)
+        self.send("意气风发", at_self=True)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
 
     def test_own_long_reply_does_not_create_loop_and_private_is_ignored(self):
         self.start()
@@ -157,15 +192,16 @@ class IdiomPluginTests(unittest.TestCase):
         self.start()
         self.ctx.succeeds = False
         self.send("意气风发")
-        self.assertEqual(self.plugin.games[ROOM].players, {})
-        self.send("合并接龙")
-        self.assertEqual(self.plugin.games[ROOM].mode, "independent")
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
+        self.ctx.succeeds = True
+        self.send("意气风发")
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
 
     def test_model_failure_keeps_question(self):
         self.start()
         with patch("plugins.idiom_chain.IdiomJudge.evaluate", side_effect=LLMError("测试超时")), self.assertLogs("IdiomTests"):
             self.send("意气风发")
-        self.assertEqual(self.plugin.games[ROOM].players[A].current, "一心一意")
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
         self.assertIn("重试", self.ctx.sent[-1][1])
 
     def test_model_opening_failure_does_not_create_game(self):
@@ -173,9 +209,30 @@ class IdiomPluginTests(unittest.TestCase):
             self.send("成语接龙")
         self.assertEqual(self.plugin.games, {})
 
+    def test_idle_game_expires_and_is_not_treated_as_chain(self):
+        self.start()
+        self.plugin.games[ROOM].updated_at -= self.plugin.idle_seconds + 1
+        count = len(self.ctx.sent)
+        self.send("意气风发")
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertNotIn(ROOM, self.plugin.games)
+        self.ctx.llm.result = {"idiom": "一心一意"}
+        self.send("成语接龙")
+        self.assertIn(ROOM, self.plugin.games)
+
     def test_invalid_member_name_configuration(self):
         for options in ({"member_names": []}, {"member_names": {ROOM: {A: "\n"}}},
                         {"member_names": {ROOM: {A: "A" * 65}}}):
             self.ctx.config = options
             with self.subTest(options=options), self.assertRaises(ValueError):
                 Plugin().on_load(self.ctx)
+
+    def test_invalid_idle_configuration(self):
+        for value in (True, 0, 59, 86401, "1800"):
+            self.ctx.config = {"member_names": {}, "idle_seconds": value}
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Plugin().on_load(self.ctx)
+
+
+if __name__ == "__main__":
+    unittest.main()

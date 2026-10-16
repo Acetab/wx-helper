@@ -1,5 +1,5 @@
 {
   "api": "v1",
-  "description": "群内成语接龙：独立艾特、合并抢答和退出；大模型判定与出题",
+  "description": "群内成语接龙：全群共享一条接龙进度，四字成语接首字；大模型判定与出题",
   "requires": ["group.text.receive", "group.text.send", "group.text.mention"]
 }

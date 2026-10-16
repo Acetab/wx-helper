@@ -53,7 +53,8 @@
     },
     "idiom_chain": {
       "enabled": false,
-      "member_names": {}
+      "member_names": {},
+      "idle_seconds": 1800
     },
     "id_responder": {
       "enabled": true
