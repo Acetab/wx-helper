@@ -44,7 +44,7 @@ class DailySummaryTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.root = Path(self.temporary.name)
         self.now = datetime(2026, 10, 10, 15, 59, 59, tzinfo=timezone.utc)  # 北京 23:59:59
-        options = {"database_file": "data.sqlite3", "history_enabled": True, "daily_clear": True,
+        options = {"database_file": "data.sqlite3", "history_enabled": True, "daily_clear": False, "owner_wxid": CAT,
                    "groups": {ROOM: [], OTHER_ROOM: []}}
         self.path = self.root / "members.json"
         self.path.write_text(json.dumps(options), encoding="utf-8")
@@ -87,26 +87,26 @@ class DailySummaryTests(unittest.TestCase):
     def snapshot(self):
         return self.store.today_snapshot("测试成员", ROOM)
 
-    def test_midnight_clears_idle_buffer_preserves_identity_and_invalidates_snapshot(self):
+    def test_midnight_preserves_archive_identity_and_existing_snapshot(self):
         self.store.record(self.message("今晚聊聊天"))
         snapshot = self.snapshot()
         self.assertEqual(snapshot.day, "2026-10-10")
         self.now += timedelta(seconds=1)
         self.assertTrue(self.store.rollover())
-        self.assertEqual(self.store.history("测试成员", ROOM), [])
-        self.assertFalse(self.store.snapshot_is_current(snapshot))
+        self.assertEqual(len(self.store.history("测试成员", ROOM)), 1)
+        self.assertTrue(self.store.snapshot_is_current(snapshot))
         self.assertEqual(self.store.resolve("测试成员", ROOM).wxid, CAT)
         self.store.record(self.message("新的一天"))
         self.assertEqual([r["text"] for r in self.snapshot().messages], ["新的一天"])
         self.assertEqual(self.snapshot().day, "2026-10-11")
 
-    def test_restart_after_missed_midnight_cleans_previous_day(self):
+    def test_restart_after_missed_midnight_preserves_archive_but_today_is_empty(self):
         self.store.record(self.message("旧记录"))
         self.store.close()
         self.now += timedelta(days=2)
         reopened = self.new_store()
         self.assertEqual(reopened.today_snapshot("测试成员", ROOM).messages, ())
-        self.assertEqual(reopened.history("测试成员", ROOM), [])
+        self.assertEqual(len(reopened.history("测试成员", ROOM)), 1)
 
     def test_restart_same_day_retains_all_text_and_aliases(self):
         self.store.record(self.message("今天的话"))
@@ -162,7 +162,7 @@ class DailySummaryTests(unittest.TestCase):
 
     def test_summary_and_clear_validate_commands_and_ignore_private_chats(self):
         self.plugin.on_message(self.message("/总结"), self.ctx)
-        self.assertEqual(self.backend.sent[-1][1], "用法：/总结 昵称")
+        self.assertIn("用法", self.backend.sent[-1][1])
         self.clear_plugin.on_message(self.message("/清空 别人"), self.ctx)
         self.assertEqual(self.backend.sent[-1][1], "用法：/清空")
         count = len(self.backend.sent)
@@ -173,8 +173,8 @@ class DailySummaryTests(unittest.TestCase):
     def test_manual_clear_command_keeps_member_registration(self):
         self.store.record(self.message("可清空的记录"))
         self.clear_plugin.on_message(self.message("/清空"), self.ctx)
-        self.assertEqual(self.snapshot().messages, ())
-        self.assertEqual(self.backend.sent[-1][1], "已清空本群聊天记录。")
+        self.assertEqual(len(self.snapshot().messages), 1)
+        self.assertIn("原文和长期知识仍保留", self.backend.sent[-1][1])
         self.assertEqual(self.store.resolve("测试成员", ROOM).wxid, CAT)
 
     def test_all_long_records_are_covered_and_partials_are_merged(self):
@@ -198,7 +198,8 @@ class DailySummaryTests(unittest.TestCase):
         self.ctx._llm = Mock(complete_json=clear_during_request)
         self.plugin.on_load(self.ctx)
         self.plugin.on_message(self.message("/总结 测试成员"), self.ctx)
-        self.assertEqual(self.backend.sent, [(ROOM, "已清空本群聊天记录。")])
+        self.assertEqual(len(self.backend.sent), 1)
+        self.assertIn("已重置", self.backend.sent[0][1])
 
     def test_json_escaping_does_not_overflow_small_batches(self):
         text = "\x01" * 2000
@@ -210,7 +211,7 @@ class DailySummaryTests(unittest.TestCase):
         units = [unit for call in self.calls for unit in call["data"] if "text" in unit]
         self.assertEqual("".join(unit["text"] for unit in units), text)
 
-    def test_midnight_during_request_cancels_result(self):
+    def test_midnight_during_request_keeps_result(self):
         self.store.record(self.message("旧天聊天"))
         def midnight(system, user):
             self.now += timedelta(seconds=1)
@@ -218,7 +219,7 @@ class DailySummaryTests(unittest.TestCase):
         self.ctx._llm = Mock(complete_json=midnight)
         self.plugin.on_load(self.ctx)
         self.plugin.on_message(self.message("/总结 测试成员"), self.ctx)
-        self.assertEqual(self.backend.sent, [])
+        self.assertTrue(self.backend.sent)
 
     def test_clear_during_pacing_prevents_native_send(self):
         self.store.record(self.message("旧记录"))
@@ -313,7 +314,7 @@ class DailySummaryTests(unittest.TestCase):
         for wxid in (ROBOT, CAT, OTHER, "wxid_unbound", ROOM):
             self.assertNotIn(wxid, payload)
         self.assertIn("当前微信群所有人的聊天", client.complete_json.call_args.args[0])
-        self.assertIn("今日群聊总结", self.backend.sent[-1][1])
+        self.assertIn("最近群聊总结", self.backend.sent[-1][1])
         self.assertIn("3条，3人", self.backend.sent[-1][1])
 
     def test_group_command_empty_or_only_commands_does_not_call_model(self):
@@ -321,11 +322,11 @@ class DailySummaryTests(unittest.TestCase):
             self.store.record(self.message(text))
         self.plugin.on_message(self.message("/总结群聊"), self.ctx)
         self.assertEqual(self.calls, [])
-        self.assertEqual(self.backend.sent[-1][1], "本群今天还没有可总结的聊天记录。")
+        self.assertIn("没有可总结", self.backend.sent[-1][1])
 
     def test_group_command_requires_exact_command_no_argument_and_group_context(self):
         self.plugin.on_message(self.message("/总结群聊 测试成员"), self.ctx)
-        self.assertEqual(self.backend.sent[-1][1], "用法：/总结群聊")
+        self.assertIn("用法", self.backend.sent[-1][1])
         count = len(self.backend.sent)
         self.plugin.on_message(self.message("/总结群聊测试"), self.ctx)
         self.plugin.on_message(Message("/总结群聊", CAT), self.ctx)
@@ -341,9 +342,10 @@ class DailySummaryTests(unittest.TestCase):
         self.ctx._llm = Mock(complete_json=clear_during_request)
         self.plugin.on_load(self.ctx)
         self.plugin.on_message(self.message("/总结群聊"), self.ctx)
-        self.assertEqual(self.backend.sent, [(ROOM, "已清空本群聊天记录。")])
+        self.assertEqual(len(self.backend.sent), 1)
+        self.assertIn("已重置", self.backend.sent[0][1])
 
-    def test_group_midnight_during_request_cancels_result(self):
+    def test_group_midnight_during_request_keeps_result(self):
         self.store.record(self.message("旧日全群聊天"))
         def midnight(system, user):
             self.now += timedelta(seconds=1)
@@ -351,7 +353,7 @@ class DailySummaryTests(unittest.TestCase):
         self.ctx._llm = Mock(complete_json=midnight)
         self.plugin.on_load(self.ctx)
         self.plugin.on_message(self.message("/总结群聊"), self.ctx)
-        self.assertEqual(self.backend.sent, [])
+        self.assertTrue(self.backend.sent)
         self.assertEqual(self.store.today_group_snapshot(ROOM).messages, ())
 
     def test_group_guard_after_send_delay_detects_clear(self):
@@ -395,10 +397,12 @@ class DailySummaryTests(unittest.TestCase):
 
     def test_runtime_rollover_runs_without_new_messages(self):
         # 禁用连接和所有插件，只验证主循环的定时清理调用。
-        config = json.loads((ROOT / "bot_config.json").read_text(encoding="utf-8"))
+        config = json.loads((ROOT / "bot_config.example.json").read_text(encoding="utf-8"))
         config["members_config_file"] = "members.json"
         config["wechat_account"] = ROBOT
         config["console"] = False
+        config["memory"] = {"enabled": False}
+        config["hourly_chat"] = {"enabled": False}
         for settings in config["plugins"].values():
             settings["enabled"] = False
         config_path = self.root / "bot_config.json"
@@ -407,6 +411,7 @@ class DailySummaryTests(unittest.TestCase):
         app = BotApplication(self.root, ConfigStore(config_path))
         app.members.close()
         app.members = Mock()
+        app.knowledge = Mock()
         app._connect = Mock()
         app.run(seconds=0.65)
         self.assertGreaterEqual(app.members.rollover.call_count, 2)

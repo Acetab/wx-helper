@@ -1,7 +1,7 @@
 {
   "name": "chat_records",
   "api": "v1",
-  "description": "手动清空当前群聊天记录",
+  "description": "管理员重置本群上下文，保留聊天原文和长期知识",
   "entry": "__init__.py",
   "requires": ["group.text.receive", "group.text.send"]
 }

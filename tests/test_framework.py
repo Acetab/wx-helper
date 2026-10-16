@@ -70,8 +70,13 @@ class FrameworkTests(unittest.TestCase):
         self.assertTrue(self.root.is_relative_to(SCRATCH.resolve()))
         shutil.copytree(ROOT / "plugins", self.root / "plugins")
         self.path = self.root / "bot_config.json"
-        self.config = json.loads((ROOT / "bot_config.json").read_text(encoding="utf-8"))
+        self.config = json.loads((ROOT / "bot_config.example.json").read_text(encoding="utf-8"))
         self.config.update(console=False, reconnect_seconds=0.1, text_send_delay={"enabled": False})
+        self.config["memory"] = {"enabled": False}
+        self.config["hourly_chat"] = {"enabled": False}
+        self.config["plugins"]["knowledge"] = {"enabled": False}
+        self.config["plugins"]["echo"]["enabled"] = True
+        self.config["plugins"]["id_responder"]["enabled"] = True
         # 框架测试不调用外部大模型；玩法单独用假客户端验证。
         self.config["plugins"]["idiom_chain"]["enabled"] = False
         self.config["plugins"]["member_identity"]["enabled"] = False

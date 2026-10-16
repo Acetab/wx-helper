@@ -132,9 +132,8 @@ class IdiomPluginTests(unittest.TestCase):
 
     def test_help_and_primary_phone_commands(self):
         self.send("/help", is_self=True)
-        self.assertEqual(self.ctx.sent[-1][1], HELP)
-        self.assertEqual(HELP, "1. 成语接龙\n\n2. /绑定 昵称\n\n3. /总结 昵称\n\n4. /总结群聊\n\n5. /切换人格 嘴臭|卑微|夸夸|取消\n\n6. 艾特机器人对话\n\n7. /清空\n\n8. /help")
-        self.assertLessEqual(len(HELP.encode("utf-8")), 1023)
+        self.assertEqual(self.ctx.sent, [])  # 帮助统一由知识插件处理，不重复回复。
+        self.assertIn("/记忆", HELP)
         self.send("成语接龙", is_self=True)
         self.assertEqual(self.ctx.sent[-1][1], "一心一意")
         self.assertIn(ROOM, self.plugin.games)

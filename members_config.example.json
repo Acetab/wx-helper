@@ -1,6 +1,7 @@
 {
   "database_file": ".runtime/member_data.sqlite3",
   "history_enabled": true,
-  "daily_clear": true,
+  "daily_clear": false,
+  "owner_wxid": null,
   "groups": {}
 }

@@ -14,6 +14,13 @@ def initialize(root=ROOT):
         except FileExistsError:
             continue
         created.append(destination.name)
+    seed = root / '.runtime/group_knowledge_seed.json'
+    template = root / 'knowledge_seed.example.json'
+    if template.is_file() and not seed.exists():
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        with seed.open('x', encoding='utf-8', newline='\n') as output:
+            output.write(template.read_text(encoding='utf-8'))
+        created.append('.runtime/group_knowledge_seed.json')
     return created
 
 

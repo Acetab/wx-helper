@@ -13,6 +13,8 @@ from pathlib import Path
 from .account import validate_account
 from .config import validate_name
 from .text import validate_mentions
+from .commands import effective_text
+from .database import backup_before_migration
 
 
 class MemberError(ValueError):
@@ -32,6 +34,8 @@ class ChatSnapshot:
     day: str
     generation: int
     messages: tuple
+    scope: str = "today"
+    anchor_id: int = 0
 
     @property
     def room(self):
@@ -44,6 +48,8 @@ class GroupChatSnapshot:
     day: str
     generation: int
     messages: tuple
+    scope: str = "today"
+    anchor_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,8 @@ class ConversationSnapshot:
     speaker_name: str
     messages: tuple
     current: str
+    group_messages: tuple = ()
+    anchor_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,11 @@ class MemberStore:
         if type(self.daily_clear) is not bool:
             raise MemberError("daily_clear 必须是布尔值")
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self.owner_wxid = options.get("owner_wxid")
+        if self.owner_wxid is not None:
+            validate_account(self.owner_wxid)
+            if self.owner_wxid == self.account:
+                raise MemberError("维护者必须是独立于机器人本号的微信账号")
         self._active_day = None
         self.groups = set(options["groups"])
         self.profiles = []
@@ -142,6 +155,7 @@ class MemberStore:
         db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
         db.row_factory = sqlite3.Row
         try:
+            backup_before_migration(db, self.path)
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -172,12 +186,20 @@ class MemberStore:
                 CREATE TABLE IF NOT EXISTS room_members (
                     account TEXT NOT NULL, room TEXT NOT NULL, wxid TEXT NOT NULL,
                     PRIMARY KEY(account,room,wxid));
-                INSERT OR IGNORE INTO room_members SELECT DISTINCT account,room,sender_id FROM messages;
+                INSERT OR IGNORE INTO room_members(account,room,wxid) SELECT DISTINCT account,room,sender_id FROM messages;
             """)
             if "self_named" not in {row["name"] for row in db.execute("PRAGMA table_info(people)")}:
                 db.execute("ALTER TABLE people ADD COLUMN self_named INTEGER NOT NULL DEFAULT 0")
             if "bot_generated" not in {row["name"] for row in db.execute("PRAGMA table_info(messages)")}:
                 db.execute("ALTER TABLE messages ADD COLUMN bot_generated INTEGER NOT NULL DEFAULT 0")
+            if "context_floor" not in {row["name"] for row in db.execute("PRAGMA table_info(chat_buffers)")}:
+                db.execute("ALTER TABLE chat_buffers ADD COLUMN context_floor INTEGER NOT NULL DEFAULT 0")
+            for column in ("first_seen", "last_seen"):
+                if column not in {row["name"] for row in db.execute("PRAGMA table_info(room_members)")}:
+                    db.execute(f"ALTER TABLE room_members ADD COLUMN {column} TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS binding_reminders (
+                account TEXT, room TEXT, wxid TEXT, reminded_at TEXT,
+                PRIMARY KEY(account,room,wxid))""")
             with db:
                 for room, key, name, display, wxid, aliases in self.profiles:
                     existing = db.execute("SELECT wxid FROM people WHERE account=? AND room=? AND person_key=?",
@@ -222,8 +244,8 @@ class MemberStore:
                 for room in self.groups:
                     db.execute("""INSERT INTO chat_buffers(account,room,local_day) VALUES(?,?,?)
                         ON CONFLICT(account,room) DO UPDATE SET local_day=excluded.local_day,
-                        generation=chat_buffers.generation+1 WHERE chat_buffers.local_day<>excluded.local_day""",
-                               (self.account, room, day))
+                        generation=chat_buffers.generation+? WHERE chat_buffers.local_day<>excluded.local_day""",
+                               (self.account, room, day, int(self.daily_clear)))
                     if self.daily_clear:
                         db.execute("DELETE FROM messages WHERE account=? AND room=? AND received_at<?",
                                    (self.account, room, start))
@@ -288,29 +310,15 @@ class MemberStore:
             self.rollover()
             state = self._connection().execute("SELECT local_day,generation FROM chat_buffers WHERE account=? AND room=?",
                                                (self.account, snapshot.room)).fetchone()
-            return bool(state and state[0] == snapshot.day and state[1] == snapshot.generation)
+            return bool(state and (not self.daily_clear or state[0] == snapshot.day)
+                        and state[1] == snapshot.generation)
 
     def personality(self, room):
         from .personality import PersonalityState
-        with self._lock:
-            row = self._connection().execute("SELECT name,generation FROM room_personalities WHERE account=? AND room=?",
-                                              (self.account, room)).fetchone()
-            return PersonalityState(room, row[0], row[1]) if row else PersonalityState(room)
+        return PersonalityState(room)
 
     def set_personality(self, room, name):
-        from .personality import PROMPTS
-        if room not in self.groups or (name not in PROMPTS and name != "默认"):
-            raise MemberError("人格应为 嘴臭、卑微、夸夸 或 默认，且在已启用的群中切换")
-        with self._lock:
-            current = self.personality(room)
-            if current.name == name:
-                return current
-            with self._connection() as db:
-                db.execute("""INSERT INTO room_personalities VALUES(?,?,?,1)
-                    ON CONFLICT(account,room) DO UPDATE SET name=excluded.name,
-                    generation=room_personalities.generation+1 WHERE room_personalities.name<>excluded.name""",
-                           (self.account, room, name))
-            return self.personality(room)
+        raise MemberError("已固定为熟人损友风格，不再切换人格")
 
     def personality_is_current(self, state):
         return self.personality(state.room) == state
@@ -324,36 +332,27 @@ class MemberStore:
             yield
 
     def conversation_snapshot(self, message):
-        """当前发言者在本群、当前消息之前的 10 条有效文本，不混入后来消息。"""
-        from .summary import CONTROL
+        """以当前消息为锚点，读取跨天的本人 10 条与全群 50 条。"""
         if message.chat_id not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
         with self._lock:
             self.rollover()
-            day, start, end = self._day_bounds()
+            day = self._day_bounds()[0]
             db = self._connection()
-            current = db.execute("""SELECT id FROM messages WHERE account=? AND room=? AND sender_id=?
-                AND session_id=? AND sequence=? AND text=? AND received_at>=? AND received_at<?
-                ORDER BY id DESC LIMIT 1""", (self.account, message.chat_id, message.sender_id,
-                message.session_id, message.sequence, message.text, start, end)).fetchone()
-            if current is None:
-                raise SnapshotExpired("当前消息已被清空或已跨天")
-            cursor = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
-                AND id<? AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id DESC""",
-                (self.account, message.chat_id, message.sender_id, current[0], start, end))
-            previous = []
-            for row in cursor:
-                text = row["text"].strip()
-                if text and "WXBOT_AT_CHAT_PROBE" not in text and text.split(maxsplit=1)[0] not in CONTROL:
-                    previous.append(dict(row))
-                    if len(previous) == 10:
-                        break
-            member = self.find_by_wxid(message.sender_id, message.chat_id)
-            state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
+            anchor = self.message_id(message)
+            state = db.execute("SELECT generation,context_floor FROM chat_buffers WHERE account=? AND room=?",
                                (self.account, message.chat_id)).fetchone()
+            if anchor is None or anchor <= state[1]:
+                raise SnapshotExpired("当前消息已被重置")
+            previous = self.recent_rows(message.chat_id, limit=10, sender_id=message.sender_id,
+                                        before_id=anchor, context=True)
+            group = self.recent_rows(message.chat_id, limit=50, before_id=anchor, context=True)
+            previous_ids = {row["id"] for row in previous}
+            group = self.label_speakers([row for row in group if row["id"] not in previous_ids], message.chat_id)
+            member = self.find_by_wxid(message.sender_id, message.chat_id)
             return ConversationSnapshot(message.chat_id, day, state[0], member.name if member else
                                         self.wechat_name(message.sender_id) or "群友",
-                                        tuple(reversed(previous)), message.text)
+                                        tuple(previous), message.text, tuple(group), anchor)
 
     @contextmanager
     def delivery_guard(self, snapshot):
@@ -503,14 +502,108 @@ class MemberStore:
             self.remember_wechat_name(message.sender_id, native_name)
         with self._lock, self._connection() as db:
             self.rollover()
-            db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
+            db.execute("INSERT OR IGNORE INTO room_members(account,room,wxid) VALUES(?,?,?)",
                        (self.account, message.chat_id, message.sender_id))
+            now = self._now().astimezone(timezone.utc).isoformat()
+            db.execute("""UPDATE room_members SET first_seen=COALESCE(first_seen,?),last_seen=?
+                WHERE account=? AND room=? AND wxid=?""",
+                       (now, now, self.account, message.chat_id, message.sender_id))
             result = db.execute("""INSERT OR IGNORE INTO messages
                 (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (self.account, message.chat_id, message.sender_id, message.text,
                  self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
+
+    def is_admin(self, wxid):
+        from .authorization import LOCAL_EDITOR
+        return wxid is LOCAL_EDITOR or bool(self.owner_wxid and wxid == self.owner_wxid)
+
+    def message_id(self, message):
+        with self._lock:
+            row = self._connection().execute("""SELECT id FROM messages WHERE account=? AND room=?
+                AND sender_id=? AND session_id=? AND sequence=? AND text=? ORDER BY id DESC LIMIT 1""",
+                (self.account, message.chat_id, message.sender_id, message.session_id,
+                 message.sequence, message.text)).fetchone()
+            return row[0] if row else None
+
+    def latest_id(self, room):
+        with self._lock:
+            return self._connection().execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE account=? AND room=?",
+                                               (self.account, room)).fetchone()[0]
+
+    def recent_rows(self, room, *, limit=200, sender_id=None, before_id=None, since=None, until=None, context=False):
+        if room not in self.groups or type(limit) is not int or not 1 <= limit <= 5000:
+            raise MemberError("查询需要已启用的群，条数应为 1—5000")
+        with self._lock:
+            self.rollover()
+            sql = "SELECT * FROM messages WHERE account=? AND room=? AND bot_generated=0"
+            values = [self.account, room]
+            for clause, value in (("sender_id=?", sender_id), ("id<?", before_id),
+                                  ("received_at>=?", since), ("received_at<?", until)):
+                if value is not None:
+                    sql += " AND " + clause
+                    values.append(value)
+            if context:
+                floor = self._connection().execute("SELECT context_floor FROM chat_buffers WHERE account=? AND room=?",
+                                                   (self.account, room)).fetchone()[0]
+                sql += " AND id>?"
+                values.append(floor)
+            rows = []
+            for row in self._connection().execute(sql + " ORDER BY id DESC", values):
+                if effective_text(row["text"]):
+                    rows.append(dict(row))
+                    if len(rows) >= limit:
+                        break
+            return list(reversed(rows))
+
+    def label_speakers(self, rows, room):
+        speakers, result = {}, []
+        for row in rows:
+            item = dict(row)
+            number = speakers.setdefault(item["sender_id"], len(speakers) + 1)
+            item.update(speaker=f"P{number}", speaker_name=self.display_name(item["sender_id"], room)
+                        or f"未绑定成员{number}")
+            result.append(item)
+        return result
+
+    def recent_snapshot(self, room, *, name=None, limit=200, today=False, before_id=None, context=False):
+        with self._lock:
+            self.rollover()
+            member = self.resolve(name, room) if name is not None else None
+            if member and not member.wxid:
+                raise MemberError("该成员尚未绑定微信 ID")
+            day, start, _ = self._day_bounds()
+            rows = self.recent_rows(room, limit=limit, sender_id=member.wxid if member else None,
+                                    before_id=before_id, since=start if today else None, context=context)
+            state = self._connection().execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
+                                               (self.account, room)).fetchone()
+            scope = "today" if today else "recent"
+            if member:
+                return ChatSnapshot(member, day, state[0], tuple(rows), scope, before_id or 0)
+            return GroupChatSnapshot(room, day, state[0], tuple(self.label_speakers(rows, room)), scope, before_id or 0)
+
+    def reset_context(self, room):
+        if room not in self.groups:
+            raise MemberError("这个群尚未启用聊天记录")
+        with self._lock:
+            self.rollover()
+            with self._connection() as db:
+                db.execute("UPDATE chat_buffers SET generation=generation+1,context_floor=? WHERE account=? AND room=?",
+                           (self.latest_id(room), self.account, room))
+
+    def binding_reminder_due(self, room, wxid):
+        if self.find_by_wxid(wxid, room) is not None:
+            return False
+        with self._lock, self._connection() as db:
+            now = self._now().astimezone(timezone.utc)
+            row = db.execute("SELECT reminded_at FROM binding_reminders WHERE account=? AND room=? AND wxid=?",
+                             (self.account, room, wxid)).fetchone()
+            if row and now - datetime.fromisoformat(row[0]) < timedelta(days=7):
+                return False
+            db.execute("INSERT OR REPLACE INTO binding_reminders VALUES(?,?,?,?)",
+                       (self.account, room, wxid, now.isoformat()))
+            return True
 
     def history(self, name, room=None, *, limit=100, since=None):
         if type(limit) is not int or not 1 <= limit <= 1000:

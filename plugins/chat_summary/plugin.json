@@ -1,7 +1,7 @@
 {
   "name": "chat_summary",
   "api": "v1",
-  "description": "DeepSeek 总结当前群成员或全群当天聊天",
+  "description": "总结个人或全群最近N条、或今天的聊天，默认200条，可跨天",
   "entry": "__init__.py",
   "requires": ["group.text.receive", "group.text.send"]
 }

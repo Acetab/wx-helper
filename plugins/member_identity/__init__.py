@@ -1,5 +1,6 @@
 """成员本人发送 /绑定 昵称，注册或更新称呼，供所有插件查询。"""
 from wxbot_framework.members import MemberError
+from wxbot_framework.commands import command_text
 
 
 class Plugin:
@@ -9,7 +10,7 @@ class Plugin:
     def on_message(self, message, ctx):
         if not message.is_group or message.type != 1 or message.chat_id not in self.members.groups:
             return
-        parts = message.text.strip().split(maxsplit=1)
+        parts = command_text(message.text).split(maxsplit=1)
         if not parts or parts[0] != "/绑定":
             return
         if len(parts) != 2:

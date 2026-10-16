@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from .commands import COMMANDS, command_text
 
 WXID = re.compile(r"^[A-Za-z0-9_.@-]{1,127}$")
 SYSTEM_PEERS = frozenset({"weixin", "fmessage", "newsapp", "floatbottle"})
@@ -10,9 +11,9 @@ FOUR_CHINESE = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff]{4}$")
 
 
 def own_group_command(text):
-    value = text.strip()
+    value = command_text(text)
     return bool(value in GROUP_CONTROL_COMMANDS or FOUR_CHINESE.fullmatch(value) or
-                value.split(maxsplit=1)[:1] in (["/绑定"], ["/总结"], ["/总结群聊"], ["/切换人格"], ["/清空"]))
+                (value.split(maxsplit=1) and value.split(maxsplit=1)[0] in COMMANDS))
 
 
 def validate_target(target):

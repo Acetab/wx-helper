@@ -41,10 +41,13 @@ class LLMClient:
     def from_file(cls, path):
         return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
 
-    def complete_json(self, system, user):
+    def complete_json(self, system, user, *, max_tokens=None):
+        budget = self.max_tokens if max_tokens is None else max_tokens
+        if type(budget) is not int or not 128 <= budget <= 4096:
+            raise ValueError("任务 max_tokens 应为128—4096的整数")
         payload = {"model": self.model, "messages": [{"role": "system", "content": system},
                                                        {"role": "user", "content": user}],
-                   "response_format": {"type": "json_object"}, "max_tokens": self.max_tokens,
+                   "response_format": {"type": "json_object"}, "max_tokens": budget,
                    "thinking": {"type": "disabled"}, "stream": False}
         request = Request(self.base_url + "/chat/completions",
                           data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

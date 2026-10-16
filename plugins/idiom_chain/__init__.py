@@ -6,11 +6,12 @@ from dataclasses import dataclass, field
 
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import SnapshotExpired
-from wxbot_framework.personality import game_reply, personality_text
+from wxbot_framework.personality import game_reply
 from wxbot_framework.text import GROUP_CONTROL_COMMANDS, FOUR_CHINESE, validate_mentions
 from .judge import IdiomJudge
+from wxbot_framework.commands import command_text, HELP_TEXT
 
-HELP = "1. 成语接龙\n\n2. /绑定 昵称\n\n3. /总结 昵称\n\n4. /总结群聊\n\n5. /切换人格 嘴臭|卑微|夸夸|取消\n\n6. 艾特机器人对话\n\n7. /清空\n\n8. /help"
+HELP = HELP_TEXT
 
 
 @dataclass
@@ -50,9 +51,10 @@ class Plugin:
         self.games.clear()
 
     def on_message(self, message, ctx):
-        if message.type != 1 or not message.is_group or message.data.get("is_at_self"):
+        if message.type != 1 or not message.is_group or (message.data.get("is_at_self") and
+                command_text(message.text) not in ("成语接龙", "合并接龙", "退出接龙")):
             return
-        text = message.text.strip()
+        text = command_text(message.text)
         if message.is_self and text not in GROUP_CONTROL_COMMANDS and not FOUR_CHINESE.fullmatch(text):
             return
         personality = ctx.personality(message)
@@ -62,14 +64,13 @@ class Plugin:
             ctx.logger.info("接龙回复已取消：人格已切换")
 
     def _handle(self, message, ctx, personality):
-        text = message.text.strip()
+        text = command_text(message.text)
         judge = IdiomJudge(ctx.llm_for(message, personality=personality))
         guard = lambda: ctx.personality_guard(personality)
         if self.session_id != message.session_id:
             self.games.clear()
             self.session_id = message.session_id
         if text == "/help":
-            ctx.reply(message, HELP, delivery_guard=guard)
             return
         game = self.games.get(message.chat_id)
         if text == "退出接龙":
@@ -115,9 +116,7 @@ class Plugin:
             verdict = judge.evaluate(chain.current, text, chain.used)
         except LLMError as error:
             ctx.logger.warning("接龙判定失败：%s", error)
-            response = (personality_text(f"暂时判不了，仍接{chain.current}。", personality.name)
-                        if personality.name == "嘴臭" else
-                        f"大模型暂时无法判定，请稍后重试。当前成语：{chain.current}")
+            response = f"大模型暂时无法判定，请稍后重试。当前成语：{chain.current}"
             accepted = False
             following, used = chain.current, chain.used
         else:

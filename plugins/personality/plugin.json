@@ -1,5 +1,5 @@
 {
   "api": "v1",
-  "description": "按群切换统一的嘴臭、卑微、夸夸人格",
+  "description": "兼容旧人格指令，提示已固定为熟人损友风格",
   "requires": ["group.text.receive", "group.text.send"]
 }

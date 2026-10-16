@@ -14,6 +14,11 @@ from .plugins import PluginManager
 from .sdk import ServiceFacade
 from .members import MemberStore
 from .personality import prepare_switch
+from .knowledge import KnowledgeStore
+from .feature_config import feature_options
+from .controls import prepare_reset
+from .maintenance import MaintenanceRouter, MaintenanceService, maintenance_options
+from .authorization import LOCAL_EDITOR
 
 logger = logging.getLogger("Bot")
 
@@ -24,10 +29,20 @@ class BotApplication:
         self.config = store.load()
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"))
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
+        self.knowledge = KnowledgeStore(self.members) if self.members is not None else None
+        self.memory_options, self.hourly_options = feature_options(self.config)
+        self.memory_worker = self.hourly_scheduler = None
+        self.maintenance_options = maintenance_options(self.config)
+        self.maintenance = (MaintenanceService(self.knowledge, app=self, options=self.maintenance_options)
+                            if self.knowledge else None)
+        self.maintenance_router = MaintenanceRouter(self.maintenance, self.service) if self.maintenance else None
+        self.startup_notice = None
+        self._background_lock = threading.RLock()
         generic = self.config.get("backend") == "native_text"
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
-                                     self.config.get("plugin_queue_size", 128), member_store=self.members)
+                                     self.config.get("plugin_queue_size", 128), member_store=self.members,
+                                     knowledge_store=self.knowledge)
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -59,16 +74,31 @@ class BotApplication:
             self._connection_ready = False
             self._log_connection_error(error)
             self._disconnect()
+        if self._connection_ready and self.startup_notice:
+            # 公告失败不影响微信连接；已持久化的发送标记避免重连重复。
+            self.startup_notice.send()
 
     def _emit(self, message):
         allowed = self.config.get("chat_allowlist", [])
+        router = getattr(self, "maintenance_router", None)
+        # 唯一维护者私聊是明确的管理通道，不要求把其个人会话加入群收发名单。
+        if (router and not message.is_group and self.members.is_admin(message.sender_id) and
+                message.chat_id == message.sender_id):
+            router.submit(message)
+            return
         if not allowed or message.chat_id in allowed:
             if self.members is not None:
                 try:
-                    self.members.record(message)
+                    inserted = self.members.record(message)
+                    worker = getattr(self, "memory_worker", None)
+                    if inserted and worker:
+                        worker.notify()
                 except Exception:
                     logger.exception("群文本保存失败，消息继续分发到插件")
             if message.data.get("dispatch_to_plugins", True):
+                message = prepare_reset(message, self.members)
+                if router and router.submit(message):
+                    return
                 if self.plugins.is_active("personality"):
                     message = prepare_switch(message, self.members)
                 self.plugins.dispatch(message)
@@ -89,15 +119,24 @@ class BotApplication:
         if not words:
             return
         action = words[0].lower()
-        if action in ("quit", "exit", "stop") and len(words) == 1:
+        if action == "manage":
+            if not self.maintenance:
+                raise ValueError("尚未配置成员目录与知识库")
+            arguments = words[1:]
+            if arguments[:1] == ["--room"]:
+                arguments[0] = "--群"
+            result = self.maintenance.execute(shlex.join(arguments), LOCAL_EDITOR)
+            logger.info("维护结果：%s", result)
+        elif action in ("quit", "exit", "stop") and len(words) == 1:
             self.stop_event.set()
         elif action == "help" and len(words) == 1:
-            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / plugins / enable 名称 / disable 名称 / reload [名称] / quit")
+            logger.info("命令：manage [--room 群ID] 帮助 / status / chats / members [群ID] / history 称呼 [条数] / plugins / enable 名称 / disable 名称 / reload [名称] / quit")
         elif action == "status" and len(words) == 1:
             logger.info("状态：%s", json.dumps({"connected": self._connection_ready,
                                                "pid": self.backend.pid if self.backend else None,
                                                "native": self.backend.diagnostics() if self.backend and hasattr(self.backend, "diagnostics") else {},
-                                               "plugins": self.plugins.status()}, ensure_ascii=False))
+                                               "plugins": self.plugins.status(),
+                                               "knowledge": self.knowledge.status() if self.knowledge else None}, ensure_ascii=False))
         elif action == "chats" and len(words) == 1:
             rows = self.backend.chats() if self.backend and hasattr(self.backend, "chats") else []
             logger.info("本次连接已接收的会话：%s", json.dumps(rows, ensure_ascii=False))
@@ -134,6 +173,47 @@ class BotApplication:
         except (OSError, ValueError):
             pass
 
+    def _start_background(self):
+        if not (self.memory_options["enabled"] or self.hourly_options["enabled"]):
+            return
+        if self.members is None or not self.members.history_enabled or self.members.daily_clear:
+            raise ValueError("长期记忆和定时聊天需要成员记录，history_enabled=true、daily_clear=false")
+        from .llm import LLMClient
+        client = LLMClient.from_file(self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"))
+        if self.memory_options["enabled"] and not self.memory_worker:
+            from .memory_worker import MemoryWorker
+            self.memory_worker = MemoryWorker(self.knowledge, client, batch_size=self.memory_options["batch_size"],
+                                              flush_seconds=self.memory_options["flush_seconds"])
+            self.memory_worker.start()
+        if self.hourly_options["enabled"] and not self.hourly_scheduler:
+            from .hourly import HourlyScheduler
+            self.hourly_scheduler = HourlyScheduler(self.knowledge, self.service, client,
+                start_hour=self.hourly_options["start_hour"], end_hour=self.hourly_options["end_hour"],
+                context_limit=self.hourly_options["context_limit"], allowlist=self.config.get("chat_allowlist", []),
+                ready=lambda: self._connection_ready)
+            self.hourly_scheduler.start()
+
+    def update_feature(self, section, changes):
+        with self._background_lock:
+            candidate = dict(self.config)
+            candidate[section] = {**candidate.get(section, {}), **changes}
+            self.store.validate(candidate)
+            memory, hourly = feature_options(candidate)
+            if memory["enabled"] or hourly["enabled"]:
+                if not self.members or not self.members.history_enabled or self.members.daily_clear:
+                    raise ValueError("后台功能需要持久化的群聊记录")
+                from .llm import LLMClient
+                LLMClient.from_file(self.store.path.parent / candidate.get("llm_config_file", "llm_config.json"))
+            if section == "memory" and self.memory_worker:
+                self.memory_worker.close()
+                self.memory_worker = None
+            if section == "hourly_chat" and self.hourly_scheduler:
+                self.hourly_scheduler.close()
+                self.hourly_scheduler = None
+            self.config = self.store.update_section(section, changes)
+            self.memory_options, self.hourly_options = feature_options(self.config)
+            self._start_background()
+
     def run(self, *, seconds=0):
         started = time.monotonic()
         next_connect = 0
@@ -141,7 +221,20 @@ class BotApplication:
         try:
             if self.members is not None:
                 self.members.initialize()
+                upgrade = self.maintenance_options["upgrade_file"]
+                self.knowledge.initialize(self.store.path.parent / self.memory_options["seed_file"],
+                                          upgrade_file=self.store.path.parent / upgrade if upgrade else None)
+                if self.maintenance_options["announcement"]:
+                    from .upgrades import StartupNotice
+                    notice = self.maintenance_options["announcement"]
+                    self.knowledge._room(notice["room"])
+                    if self.config.get("chat_allowlist") and notice["room"] not in self.config["chat_allowlist"]:
+                        raise ValueError("更新公告群不在当前收发范围内")
+                    self.startup_notice = StartupNotice(self.knowledge, self.service, notice)
+            self._start_background()
             self.plugins.reload()
+            if self.maintenance_router:
+                self.maintenance_router.start()
             if self.config.get("console", True):
                 threading.Thread(target=self._read_console, name="BotConsole", daemon=True).start()
             logger.info("框架已启动；输入 help 查看插件管理命令，Ctrl+C 退出")
@@ -180,6 +273,12 @@ class BotApplication:
     def stop(self):
         self.stop_event.set()
         self.service.cancel_pending()
+        if self.maintenance_router:
+            self.maintenance_router.close()
+        if self.hourly_scheduler:
+            self.hourly_scheduler.close()
+        if self.memory_worker:
+            self.memory_worker.close()
         self.plugins.shutdown()
         cleaned = self._disconnect()
         if self.members is not None:

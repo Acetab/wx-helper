@@ -4,6 +4,10 @@
 
 面向 Windows x64、微信 4.1.15.13 的 Python 插件框架。统一入口为 `main.py`，原生桥接负责文本收发，功能以插件加载。
 
+完整操作说明见[使用手册](使用手册.md)。已有用户可运行 `python tools/migrate_memory.py` 升级本地配置及数据库，再正常重启机器人。
+
+本 fork 的维护仓库为 [Inmata/helper](https://github.com/Inmata/helper)，原始项目为 [Prometheus-first/helper](https://github.com/Prometheus-first/helper)。日常更新从自己的 fork 获取；原项目保留为 `upstream`，按需评估后合并。
+
 
 # 本项目仅供学习，请勿用于违法行为
 
@@ -12,10 +16,14 @@
 - 文件传输助手、好友和群聊文本收发，以及真正的群艾特。
 - 成语接龙：独立玩家、合并抢答和退出模式。
 - `/绑定 昵称`：只设置当前群的称呼；不同群各自保存。未绑定时使用联系人缓存中的微信名。
-- `/总结 昵称`、`/总结群聊`：通过配置的大模型总结当前群当天的文字记录。
-- `/切换人格 嘴臭|卑微|夸夸|取消`：为当前群的对话、总结和接龙点评设置表达风格。
-- 真正艾特机器人后对话，携带该成员在当前群当天此前最多十条有效发言。
-- 每天北京时间 0 点清理旧日文本；`/清空` 手动清理当前群文本。
+- `/总结 昵称 [条数或今天]`、`/总结群聊 [条数或今天]`：默认总结最近200条，可跨天。
+- 固定熟人损友语气；旧人格切换指令只显示兼容提示。
+- 真正艾特机器人后，结合本人最近10条、全群最近50条和检索到的长期知识回复。
+- 原文与知识长期保存；管理员 `/清空` 仅重置对话上下文，保留历史和知识。
+- `/档案`、`/记忆`、`/纠正`、`/忘记`：查询和维护有来源的成员资料、语言习惯与群梗。
+- 唯一维护者可在群聊、私聊使用 `/管理`；服务器控制台和离线命令行共用维护逻辑，支持人物、别名、知识归属、清空重学和操作历史。
+- 可配置本版本首次启动后的更新公告，重连和再次重启不重复发送。
+- 可配置自动学习，以及09:00—23:00有新聊天时的整点发言。
 - 按文本长度随机等待后发送。
 - 插件启停、重载与开发模板。
 
@@ -39,7 +47,8 @@ python tools/init_config.py
 {
   "database_file": ".runtime/member_data.sqlite3",
   "history_enabled": true,
-  "daily_clear": true,
+  "daily_clear": false,
+  "owner_wxid": "wxid_example_owner",
   "groups": {
     "12345678@chatroom": []
   }
@@ -48,6 +57,8 @@ python tools/init_config.py
 
 3. `llm_config.json`：填写自己的 `api_key`、`base_url` 和 `model`。模板保留 DeepSeek 接口格式，密钥为空。
 4. 模板默认关闭需要模型的 `idiom_chain`、`chat_summary`、`mention_chat` 插件。填写模型配置后，把它们的 `enabled` 改为 `true`。
+
+`owner_wxid` 必须填写维护者本人账号，不能填写机器人本号。留空时聊天维护关闭，服务器命令行仍可用。旧 `admin_wxids` 不再授予权限。
 
 账号 ID 必须是实际微信 ID；群 ID 以 `@chatroom` 结尾。`test` 消息会由 `id_responder` 插件回复当前会话 ID，`chats` 控制台命令可以列出本次连接收到消息的会话。所有示例 ID 和测试用名称均为虚构数据。
 
@@ -66,6 +77,7 @@ python main.py
 
 ```text
 status
+manage --room 群ID 帮助
 chats
 members [群ID]
 history 称呼 [条数]

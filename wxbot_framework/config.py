@@ -6,6 +6,7 @@ import math
 import re
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 PLUGIN_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -20,11 +21,19 @@ def validate_name(name):
 class ConfigStore:
     def __init__(self, path):
         self.path = Path(path).resolve()
+        self._write_lock = threading.RLock()
 
     def load(self):
         data = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        return self.validate(data)
+
+    def validate(self, data):
         if not isinstance(data, dict):
             raise ValueError("配置文件必须是 JSON 对象")
+        from .feature_config import feature_options
+        feature_options(data)
+        from .maintenance import maintenance_options
+        maintenance_options(data)
         if data.get("backend", "native_filehelper") not in ("native_filehelper", "native_text"):
             raise ValueError("backend 应为 native_filehelper 或 native_text")
         from .pacing import TextSendDelay
@@ -69,8 +78,19 @@ class ConfigStore:
 
     def set_enabled(self, name, enabled):
         validate_name(name)
-        data = self.load()
-        data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
+        with self._write_lock:
+            data = self.load()
+            data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
+            return self.save(data)
+
+    def update_section(self, section, changes):
+        with self._write_lock:
+            data = self.load()
+            data.setdefault(section, {}).update(changes)
+            return self.save(data)
+
+    def save(self, data):
+        self.validate(data)
         # 在同一目录完成替换，避免中断写入留下半份 JSON。
         descriptor, temporary = tempfile.mkstemp(prefix=".bot_config_", suffix=".tmp", dir=self.path.parent)
         try:

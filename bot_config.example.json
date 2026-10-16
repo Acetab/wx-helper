@@ -9,6 +9,23 @@
   "log_level": "INFO",
   "llm_config_file": "llm_config.json",
   "members_config_file": "members_config.json",
+  "maintenance": {
+    "default_room": null,
+    "upgrade_file": null,
+    "announcement": null
+  },
+  "memory": {
+    "enabled": false,
+    "batch_size": 50,
+    "flush_seconds": 600,
+    "seed_file": ".runtime/group_knowledge_seed.json"
+  },
+  "hourly_chat": {
+    "enabled": false,
+    "start_hour": 9,
+    "end_hour": 23,
+    "context_limit": 200
+  },
   "text_send_delay": {
     "enabled": true,
     "characters_per_group": 10,
@@ -16,6 +33,9 @@
     "max_seconds": 0.3
   },
   "plugins": {
+    "knowledge": {
+      "enabled": true
+    },
     "personality": {
       "enabled": true
     },

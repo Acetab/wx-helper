@@ -47,6 +47,30 @@ def main():
             parser.error("请先在本地 bot_config.json 中将 wechat_account 占位符改为自己的机器人账号 ID")
         app = BotApplication(ROOT, store)
         if args.check or args.list_plugins:
+            if args.check and (app.memory_options["enabled"] or app.hourly_options["enabled"]):
+                if app.members is None or not app.members.history_enabled or app.members.daily_clear:
+                    raise ValueError("长期记忆需要 history_enabled=true、daily_clear=false")
+                from wxbot_framework.llm import LLMClient
+                LLMClient.from_file(store.path.parent / config.get("llm_config_file", "llm_config.json"))
+            seed = store.path.parent / app.memory_options["seed_file"]
+            if args.check and seed.is_file():
+                from wxbot_framework.knowledge import read_seed
+                read_seed(seed)
+            upgrade = app.maintenance_options["upgrade_file"]
+            if args.check and upgrade:
+                from wxbot_framework.upgrades import read_upgrade
+                if app.knowledge is None:
+                    raise ValueError("资料修订需要成员目录和知识库")
+                read_upgrade(app.knowledge, store.path.parent / upgrade)
+            if args.check:
+                if app.maintenance_options["default_room"]:
+                    if app.maintenance is None:
+                        raise ValueError("维护目标需要成员目录")
+                    app.maintenance.room()
+                if app.maintenance_options["announcement"]:
+                    if app.maintenance is None:
+                        raise ValueError("更新公告需要成员目录")
+                    app.maintenance.room(explicit=app.maintenance_options["announcement"]["room"])
             specs = app.plugins.discover()
             if app.plugins.load_errors:
                 raise ValueError(str(app.plugins.load_errors))

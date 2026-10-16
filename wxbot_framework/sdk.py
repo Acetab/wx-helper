@@ -71,6 +71,11 @@ class ServiceFacade:
         with self._lock:
             return self._backend is not None and self._available
 
+    @property
+    def session_id(self):
+        with self._lock:
+            return self._backend.session_id if self._backend is not None and self._available else None
+
     def send_text(self, to_wxid, content, *, expected_session=None, _mentions=(), delivery_guard=None):
         validate_target(to_wxid)
         if not isinstance(content, str):
@@ -155,7 +160,7 @@ class LegacyService:
 
 
 class PluginContext:
-    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None):
+    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None, knowledge_store=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -164,12 +169,21 @@ class PluginContext:
         self._llm_config_path = llm_config_path
         self._llm = None
         self._members = member_store
+        self._knowledge = knowledge_store
 
     @property
     def members(self):
         if self._members is None:
             raise CapabilityError("尚未配置框架成员目录")
         return self._members
+
+    @property
+    def knowledge(self):
+        if self._knowledge is None:
+            from .knowledge import KnowledgeStore
+            self._knowledge = KnowledgeStore(self.members)
+            self._knowledge.initialize()
+        return self._knowledge
 
     @property
     def llm(self):
