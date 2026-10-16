@@ -231,7 +231,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(notice.send())
         self.assertEqual(len(self.backend.sent), 2)
 
-    def test_notice_unknown_result_does_not_automatically_repeat(self):
+    def test_notice_unknown_result_does_not_repeat_within_one_run(self):
         k = self.kb()
         options = {"id": "uncertain", "room": ROOM, "text": "更新完成。"}
         facade = Mock(session_id="test", send_text=Mock(side_effect=RuntimeError("断线")))
@@ -240,6 +240,32 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(notice.status(), "unknown")
         self.assertFalse(notice.send())
         self.assertEqual(facade.send_text.call_count, 1)
+        facade.send_text = Mock(return_value=True)
+        notice.retry()
+        self.assertTrue(notice.send())
+        self.assertEqual(notice.status(), "sent")
+
+    def test_notice_retries_unconfirmed_result_on_next_start(self):
+        k = self.kb()
+        options = {"id": "uncertain", "room": ROOM, "text": "更新完成。"}
+        broken = Mock(session_id="test", send_text=Mock(side_effect=RuntimeError("断线")))
+        self.assertFalse(StartupNotice(k, broken, options).send())
+        self.assertEqual(StartupNotice(k, broken, options).status(), "unknown")
+        self.assertTrue(StartupNotice(k, self.service, options).send())
+        self.assertEqual(StartupNotice(k, self.service, options).status(), "sent")
+        self.assertEqual(len(self.backend.sent), 1)
+
+    def test_notice_waits_for_connection_without_spending_the_attempt(self):
+        k = self.kb()
+        options = {"id": "waiting", "room": ROOM, "text": "更新完成。"}
+        offline = Mock(session_id=None)
+        notice = StartupNotice(k, offline, options)
+        self.assertFalse(notice.send())
+        self.assertEqual(notice.status(), "pending")
+        notice.service = self.service
+        self.assertTrue(notice.send())
+        self.assertEqual(notice.status(), "sent")
+        self.assertEqual(len(self.backend.sent), 1)
 
     def test_profile_upgrade_splits_people_and_preserves_item_ids_and_sources(self):
         k = self.kb()

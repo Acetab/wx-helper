@@ -386,7 +386,9 @@ class MaintenanceService:
             if not app.startup_notice:
                 raise MemberError("尚未配置本次更新公告")
             if words[1] == "状态":
-                return "本版本公告状态：" + app.startup_notice.status()
+                info = app.startup_notice.describe()
+                return (f"本版本公告状态：{info['status']}（id={info['id']}，群={info['room']}，"
+                        f"最近尝试={info['updated_at'] or '尚未发送'}）")
             if words[1] == "重发":
                 if not app._connection_ready:
                     raise MemberError("微信尚未连接，未重发公告")

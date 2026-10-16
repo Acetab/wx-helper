@@ -130,6 +130,8 @@ class StartupNotice:
         self.knowledge, self.service, self.options = knowledge, service, options
         digest = hashlib.sha256(options["text"].encode("utf-8")).hexdigest()[:12]
         self.notice_id = f"{options['id']}#{digest}"
+        # 单次运行只尝试一次；上次结果未确认时交给下次启动重试。
+        self._attempted = False
 
     def status(self):
         k, o = self.knowledge, self.options
@@ -138,29 +140,55 @@ class StartupNotice:
                                   (k.account, o["room"], self.notice_id)).fetchone()
             return row[0] if row else "pending"
 
+    def describe(self):
+        """维护命令用的可读状态：本版本公告 ID、目标群、结果与最近尝试时间。"""
+        k, o = self.knowledge, self.options
+        with k._lock:
+            row = k._db().execute("SELECT status,updated_at FROM startup_notices "
+                                  "WHERE account=? AND room=? AND notice_id=?",
+                                  (k.account, o["room"], self.notice_id)).fetchone()
+        status, updated = (row["status"], row["updated_at"]) if row else ("pending", "")
+        return {"id": self.notice_id, "room": o["room"], "status": status, "updated_at": updated}
+
     def retry(self):
         k, o = self.knowledge, self.options
+        # 手动重发时允许同一次运行内再次尝试。
+        self._attempted = False
         with k._lock, k._db() as db:
             db.execute("DELETE FROM startup_notices WHERE account=? AND room=? AND notice_id=?",
                        (k.account, o["room"], self.notice_id))
 
     def send(self):
         k, o, session = self.knowledge, self.options, self.service.session_id
+        if self._attempted:
+            return False
         if not session:
+            logger.info("启动公告暂缓：微信会话尚未就绪（%s）", self.notice_id)
             return False
         k._room(o["room"])
         with k._lock, k._db() as db:
-            claimed = db.execute("INSERT OR IGNORE INTO startup_notices VALUES(?,?,?,'sending',?)",
-                                  (k.account, o["room"], self.notice_id, k.now())).rowcount
+            # 已确认发送成功的版本不再重复；结果未确认的允许在下次启动重试。
+            claimed = db.execute(
+                "INSERT INTO startup_notices(account,room,notice_id,status,updated_at) VALUES(?,?,?,'sending',?) "
+                "ON CONFLICT(account,room,notice_id) DO UPDATE SET status='sending',updated_at=excluded.updated_at "
+                "WHERE startup_notices.status<>'sent'",
+                (k.account, o["room"], self.notice_id, k.now())).rowcount
             if not claimed:
+                logger.info("启动公告跳过：本版本已公告过（%s）", self.notice_id)
                 return False
+        self._attempted = True
         status = "unknown"
+        logger.info("启动公告开始发送：%s -> %s", self.notice_id, o["room"])
         try:
             success = self.service.send_text(o["room"], o["text"], expected_session=session)
             status = "sent" if success else "unknown"
+            if success:
+                logger.info("启动公告已发送：%s -> %s", self.notice_id, o["room"])
+            else:
+                logger.warning("启动公告结果待确认，下次启动会重试：%s", self.notice_id)
             return bool(success)
         except Exception as error:
-            logger.warning("更新公告结果待确认：%s", type(error).__name__)
+            logger.warning("启动公告发送失败，下次启动会重试：%s（%s）", self.notice_id, type(error).__name__)
             return False
         finally:
             with k._lock, k._db() as db:

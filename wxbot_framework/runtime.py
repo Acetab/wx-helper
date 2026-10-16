@@ -77,7 +77,7 @@ class BotApplication:
             self._log_connection_error(error)
             self._disconnect()
         if self._connection_ready and self.startup_notice:
-            # 公告失败不影响微信连接；已持久化的发送标记避免重连重复。
+            # 公告失败不影响微信连接；已确认发送的版本不重复，未确认的下次启动重试。
             self.startup_notice.send()
 
     def sync_wechat_directory(self, room=None):
@@ -256,6 +256,8 @@ class BotApplication:
                     if self.config.get("chat_allowlist") and notice["room"] not in self.config["chat_allowlist"]:
                         raise ValueError("更新公告群不在当前收发范围内")
                     self.startup_notice = StartupNotice(self.knowledge, self.service, notice)
+                    logger.info("启动公告就绪：%s -> %s（当前状态：%s）", self.startup_notice.notice_id,
+                                notice["room"], self.startup_notice.status())
             self._start_background()
             self.plugins.reload()
             if self.maintenance_router:
