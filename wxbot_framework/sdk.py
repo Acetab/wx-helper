@@ -160,7 +160,8 @@ class LegacyService:
 
 
 class PluginContext:
-    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None, knowledge_store=None):
+    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None,
+                 knowledge_store=None, room_state_store=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -170,12 +171,18 @@ class PluginContext:
         self._llm = None
         self._members = member_store
         self._knowledge = knowledge_store
+        self._room_state = room_state_store
 
     @property
     def members(self):
         if self._members is None:
             raise CapabilityError("尚未配置框架成员目录")
         return self._members
+
+    @property
+    def room_state(self):
+        """按群共享的插件状态；未配置成员目录时为 None，插件需自行降级。"""
+        return self._room_state
 
     @property
     def knowledge(self):

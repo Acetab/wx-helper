@@ -10,7 +10,7 @@ import sys
 import threading
 import types
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import validate_name
@@ -107,7 +107,8 @@ class PluginRecord:
 
 
 class PluginManager:
-    def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None, knowledge_store=None):
+    def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None,
+                 knowledge_store=None, room_state_store=None):
         self.directory = Path(directory).resolve()
         self.store, self.service = store, service
         self.capabilities = frozenset(capabilities)
@@ -118,6 +119,7 @@ class PluginManager:
         self.config = store.load()
         self.member_store = member_store
         self.knowledge_store = knowledge_store
+        self.room_state_store = room_state_store
 
     def is_active(self, name):
         with self._lock:
@@ -155,7 +157,8 @@ class PluginManager:
         options = self.config.get("plugins", {}).get(spec.name, {})
         context = PluginContext(spec.name, options, self.service, self.capabilities,
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
-                                member_store=self.member_store, knowledge_store=self.knowledge_store)
+                                member_store=self.member_store, knowledge_store=self.knowledge_store,
+                                room_state_store=self.room_state_store)
         # 每次使用独立模块名并重新编译源文件，热重载不复用旧入口字节码。
         if "_wxbot_plugins" not in sys.modules:
             package = types.ModuleType("_wxbot_plugins")
@@ -251,6 +254,13 @@ class PluginManager:
     def dispatch(self, message):
         with self._lock:
             records = tuple(self.records.values())
+        if message.is_group and self.room_state_store is not None:
+            try:
+                states = self.room_state_store.snapshot(message.chat_id)
+            except Exception:
+                logger.warning("读取群功能快照失败，消息继续分发", exc_info=True)
+                states = {}
+            message = replace(message, data=types.MappingProxyType({**message.data, "room_states": states}))
         for record in records:
             record.enqueue(message)
 

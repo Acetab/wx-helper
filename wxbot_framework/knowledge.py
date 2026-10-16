@@ -389,8 +389,8 @@ class KnowledgeStore(KnowledgeAdminMixin):
             ranked = []
             for row in self._db().execute("SELECT * FROM knowledge_items WHERE account=? AND room=? AND status='active'",
                                          (self.account, room)):
-                entity = entities[row["entity_id"]]
-                if row["epoch"] != entity["epoch"]:
+                entity = entities.get(row["entity_id"])
+                if entity is None or row["epoch"] != entity["epoch"]:
                     continue
                 if not self.visible(entity) or (entity_id is not None and entity["id"] != entity_id):
                     continue

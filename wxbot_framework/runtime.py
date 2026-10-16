@@ -16,6 +16,7 @@ from .sdk import ServiceFacade
 from .members import MemberStore
 from .personality import prepare_switch
 from .knowledge import KnowledgeStore
+from .room_state import RoomStateStore
 from .feature_config import feature_options
 from .controls import prepare_reset
 from .maintenance import MaintenanceRouter, MaintenanceService, maintenance_options
@@ -31,6 +32,7 @@ class BotApplication:
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"))
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
         self.knowledge = KnowledgeStore(self.members) if self.members is not None else None
+        self.room_state = RoomStateStore(self.members) if self.members is not None else None
         self.memory_options, self.hourly_options = feature_options(self.config)
         self.memory_worker = self.hourly_scheduler = None
         self.maintenance_options = maintenance_options(self.config)
@@ -43,7 +45,7 @@ class BotApplication:
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
                                      self.config.get("plugin_queue_size", 128), member_store=self.members,
-                                     knowledge_store=self.knowledge)
+                                     knowledge_store=self.knowledge, room_state_store=self.room_state)
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -249,6 +251,8 @@ class BotApplication:
                 upgrade = self.maintenance_options["upgrade_file"]
                 self.knowledge.initialize(self.store.path.parent / self.memory_options["seed_file"],
                                           upgrade_file=self.store.path.parent / upgrade if upgrade else None)
+                if self.room_state is not None:
+                    self.room_state.initialize()
                 if self.maintenance_options["announcement"]:
                     from .upgrades import StartupNotice
                     notice = self.maintenance_options["announcement"]

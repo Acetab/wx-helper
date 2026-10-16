@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest.mock import Mock
 
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
@@ -115,6 +116,31 @@ class FrameworkTests(unittest.TestCase):
         return Message.from_native(11046, {"msg": text, "from_wxid": "filehelper", "room_wxid": "",
                                            "native_sender": "self_test", "native_receiver": "filehelper",
                                            "sequence": sequence}, self.backend.session_id)
+
+    def test_dispatch_captures_room_state_before_any_plugin_processes_message(self):
+        state = {"idiom_chain": {"current": "一心一意"}}
+        self.manager.room_state_store = Mock(snapshot=Mock(side_effect=lambda room: json.loads(json.dumps(state))))
+        first, second = Mock(), Mock()
+        first.enqueue.side_effect = lambda message: state["idiom_chain"].update(current="发扬光大")
+        self.manager.records = {"first": first, "second": second}
+        message = Message("意气风发", "123@chatroom", is_group=True)
+        try:
+            self.manager.dispatch(message)
+            self.assertEqual(second.enqueue.call_args.args[0].data["room_states"]["idiom_chain"]["current"], "一心一意")
+            self.assertNotIn("room_states", message.data)
+            self.manager.room_state_store.snapshot.assert_called_once_with(message.chat_id)
+        finally:
+            self.manager.records = {}
+
+    def test_state_read_failure_does_not_stop_message_dispatch(self):
+        self.manager.room_state_store = Mock(snapshot=Mock(side_effect=RuntimeError("读取失败")))
+        record = Mock()
+        self.manager.records = {"example": record}
+        try:
+            self.manager.dispatch(Message("普通聊天", "123@chatroom", is_group=True))
+            record.enqueue.assert_called_once()
+        finally:
+            self.manager.records = {}
 
     def test_new_and_legacy_plugins_receive_unicode_snapshot(self):
         self.manager.reload()

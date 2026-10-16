@@ -412,6 +412,7 @@ class DailySummaryTests(unittest.TestCase):
         app.members.close()
         app.members = Mock()
         app.knowledge = Mock()
+        app.room_state = Mock()
         app._connect = Mock()
         app.run(seconds=0.65)
         self.assertGreaterEqual(app.members.rollover.call_count, 2)

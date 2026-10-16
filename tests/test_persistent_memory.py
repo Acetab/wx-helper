@@ -18,6 +18,7 @@ from wxbot_framework.members import MemberError
 from wxbot_framework.memory_worker import MemoryWorker
 from wxbot_framework.config import ConfigStore
 from wxbot_framework.runtime import BotApplication
+from wxbot_framework.room_state import RoomStateStore
 
 ROOM, CAT, OTHER, ROBOT = daily.ROOM, daily.CAT, daily.OTHER, daily.ROBOT
 
@@ -127,6 +128,42 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(other.search(ROOM, "吉他"), [])
         with self.assertRaises(MemberError):
             other.edit(ROOM, item, ROBOT, forget=True)
+
+    def test_search_skips_missing_entities_without_losing_valid_items(self):
+        kb = self.kb()
+        valid = self.put(kb)
+        self.put(kb, "无效引用", wxid=OTHER)
+        missing = kb.member_entity(ROOM, OTHER)["id"]
+        with kb._db() as db:
+            db.execute("DELETE FROM knowledge_entities WHERE id=?", (missing,))
+        entity = kb.member_entity(ROOM, CAT)["id"]
+        for query, options in (("吉他", {}), ("", {"entity_id": entity})):
+            with self.subTest(query=query):
+                self.assertEqual([item["id"] for item in kb.search(ROOM, query, **options)], [valid])
+
+    def test_search_does_not_resolve_an_item_against_another_room_or_account(self):
+        kb = self.kb()
+        valid = self.put(kb)
+        bad = self.put(kb, "吉他", wxid=OTHER)
+        for foreign in (kb.entity(daily.OTHER_ROOM, "其他群人物", pinned=True),
+                        KnowledgeStore(self.new_store("wxid_second_robot"))):
+            if isinstance(foreign, KnowledgeStore):
+                foreign.initialize()
+                foreign = foreign.entity(ROOM, "其他账号人物", pinned=True)
+            with kb._db() as db:
+                db.execute("UPDATE knowledge_items SET entity_id=? WHERE id=?", (foreign["id"], bad))
+            with self.subTest(entity=foreign["id"]):
+                self.assertEqual([item["id"] for item in kb.search(ROOM, "吉他")], [valid])
+
+    def test_room_state_snapshot_is_detached_and_isolated_by_room_and_account(self):
+        state = RoomStateStore(self.store)
+        state.put(ROOM, "idiom_chain", {"current": "一心一意"})
+        state.put(daily.OTHER_ROOM, "idiom_chain", {"current": "异想天开"})
+        before = state.snapshot(ROOM)
+        state.put(ROOM, "idiom_chain", {"current": "发扬光大"})
+        self.assertEqual(before, {"idiom_chain": {"current": "一心一意"}})
+        self.assertEqual(state.snapshot(daily.OTHER_ROOM), {"idiom_chain": {"current": "异想天开"}})
+        self.assertEqual(RoomStateStore(self.new_store("wxid_second_robot")).snapshot(ROOM), {})
 
     def test_same_nickname_does_not_link_space_person_to_member(self):
         kb = self.kb()

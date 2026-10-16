@@ -1,11 +1,17 @@
-"""群聊成语接龙；全群共享一条接龙进度，空闲一段时间后自动结束。"""
+"""群聊成语接龙；全群共享一条接龙进度，空闲一段时间后自动结束。
+
+进度写进按群共享的状态表，重启、重连或插件重载后可以接着上一局继续；
+艾特机器人发的成语同样算答案，人格对话靠同一份状态知道当前接字。
+"""
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import SnapshotExpired
+from wxbot_framework.mentions import strip_at_labels
 from wxbot_framework.personality import game_reply
 from wxbot_framework.text import FOUR_CHINESE, GROUP_CONTROL_COMMANDS, validate_mentions
 from .judge import IdiomJudge
@@ -13,6 +19,13 @@ from wxbot_framework.commands import command_text, HELP_TEXT
 
 HELP = HELP_TEXT
 DEFAULT_IDLE_SECONDS = 1800
+FEATURE = "idiom_chain"
+USED_LIMIT = 200
+
+
+def answer_text(text):
+    """接龙答案的正文：去掉任意位置的艾特标签，与人格对话的判定口径保持一致。"""
+    return strip_at_labels(text).strip()
 
 
 @dataclass
@@ -33,7 +46,7 @@ class Plugin:
     def on_load(self, ctx):
         self.judge = IdiomJudge(ctx.llm)
         self.games = {}
-        self.session_id = None
+        self.room_state = getattr(ctx, "room_state", None)
         self.member_names = ctx.config.get("member_names", {})
         if not isinstance(self.member_names, dict):
             raise ValueError("idiom_chain.member_names 应为按群 ID 分类的昵称配置")
@@ -56,9 +69,8 @@ class Plugin:
         if message.type != 1 or not message.is_group:
             return
         text = command_text(message.text)
-        if message.data.get("is_at_self") and text not in GROUP_CONTROL_COMMANDS:
-            return
-        if message.is_self and text not in GROUP_CONTROL_COMMANDS and not FOUR_CHINESE.fullmatch(text):
+        # 答案去掉任意位置的艾特标签：群里常把“成语@机器人”和“@机器人 成语”都当答案发。
+        if message.is_self and text not in GROUP_CONTROL_COMMANDS and not FOUR_CHINESE.fullmatch(answer_text(message.text)):
             return
         personality = ctx.personality(message)
         try:
@@ -66,27 +78,83 @@ class Plugin:
         except SnapshotExpired:
             ctx.logger.info("接龙回复已取消：人格已切换")
 
-    def _expire(self, room, now=None):
+    def _expire(self, ctx, room, now=None):
         """空闲超时的局直接作废，避免后来的四字消息被当成接龙。"""
         game = self.games.get(room)
         if game and (now if now is not None else time.monotonic()) - game.updated_at > self.idle_seconds:
-            self.games.pop(room, None)
+            self._drop(ctx, room)
             return True
         return False
+
+    def _game(self, room):
+        """内存里的局；没有时尝试用上次运行留下的进度续上。"""
+        game = self.games.get(room)
+        if game is None:
+            game = self._restore(room)
+            if game is not None:
+                self.games[room] = game
+        return game
+
+    def _restore(self, room):
+        if self.room_state is None:
+            return None
+        try:
+            state = self.room_state.get(room, FEATURE)
+        except Exception:
+            return None
+        if not isinstance(state, dict):
+            return None
+        current, used = state.get("current"), state.get("used")
+        if not isinstance(current, str) or not FOUR_CHINESE.fullmatch(current):
+            return None
+        words = tuple(word for word in used if isinstance(word, str) and FOUR_CHINESE.fullmatch(word)) \
+            if isinstance(used, list) else ()
+        if current not in words:
+            return None
+        try:
+            saved = datetime.fromisoformat(state.get("updated_at"))
+        except (TypeError, ValueError):
+            return None
+        if saved.tzinfo is None:
+            saved = saved.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - saved).total_seconds()
+        if age < 0 or age > self.idle_seconds:
+            return None
+        # 续局保留剩余空闲时间：重启本身不给这一局续命。
+        return Game(words[0], Chain(current, words), time.monotonic() - age)
+
+    def _save(self, ctx, room):
+        """把当前进度写回共享状态；没有局就清掉，供人格对话和续局读取。"""
+        if self.room_state is None:
+            return
+        game = self.games.get(room)
+        try:
+            if game is None:
+                self.room_state.clear(room, FEATURE)
+            else:
+                self.room_state.put(room, FEATURE, {
+                    "current": game.chain.current,
+                    "used": list(game.chain.used[-USED_LIMIT:]),
+                    "idle_seconds": self.idle_seconds,
+                    "updated_at": datetime.now(timezone.utc).isoformat()})
+        except Exception as error:  # 进度只用于续局，存不下不影响本轮接龙
+            ctx.logger.warning("接龙进度保存失败：%s", error)
+
+    def _drop(self, ctx, room):
+        self.games.pop(room, None)
+        self._save(ctx, room)
 
     def _handle(self, message, ctx, personality):
         text = command_text(message.text)
         judge = IdiomJudge(ctx.llm_for(message, personality=personality))
         guard = lambda: ctx.personality_guard(personality)
-        if self.session_id != message.session_id:
-            self.games.clear()
-            self.session_id = message.session_id
         if text == "/help":
             return
-        self._expire(message.chat_id)
-        game = self.games.get(message.chat_id)
+        room = message.chat_id
+        self._expire(ctx, room)
+        game = self._game(room)
         if text == "退出接龙":
-            self.games.pop(message.chat_id, None)
+            self._drop(ctx, room)
             ctx.reply(message, "已退出接龙。", delivery_guard=guard)
             return
         if text == "成语接龙":
@@ -102,7 +170,8 @@ class Plugin:
                 return
             reply = f"{opening}\n请接以“{opening[-1]}”开头的四字成语，发送“退出接龙”结束。"
             if ctx.reply(message, reply, delivery_guard=guard):
-                self.games[message.chat_id] = Game(opening, Chain(opening, (opening,), time.monotonic()))
+                self.games[room] = Game(opening, Chain(opening, (opening,), time.monotonic()))
+                self._save(ctx, room)
             return
         if text == "合并接龙":
             if not game:
@@ -110,26 +179,37 @@ class Plugin:
                 return
             ctx.reply(message, f"接龙进度全群共享，当前仍是：{game.chain.current}。", delivery_guard=guard)
             return
-        if not game or not text or text.startswith("/") or not FOUR_CHINESE.fullmatch(text):
+        answer = answer_text(message.text)
+        if not game or not answer or answer.startswith("/") or not FOUR_CHINESE.fullmatch(answer):
             return
         chain = game.chain
         if message.received_at <= chain.ready_at:
             return  # 同一轮判定/发题期间到达的抢答不重复计入。
-        if text[0] != chain.current[-1]:
+        if answer[0] != chain.current[-1]:
             return  # 与当前接字无关的四字消息按普通聊天处理，不打断群聊。
-        name = self.member_names.get(message.chat_id, {}).get(message.sender_id)
+        name = self.member_names.get(room, {}).get(message.sender_id)
         try:
-            verdict = judge.evaluate(chain.current, text, chain.used)
+            verdict = judge.evaluate(chain.current, answer, chain.used)
         except LLMError as error:
             ctx.logger.warning("接龙判定失败：%s", error)
             if ctx.reply_at(message, f"大模型暂时无法判定，请稍后重试。当前成语：{chain.current}",
                             display_name=name, delivery_guard=guard):
                 game.chain = Chain(chain.current, chain.used, time.monotonic())
                 game.updated_at = time.monotonic()
+                self._save(ctx, room)
             return
-        following = verdict.next_idiom if verdict.accepted else chain.current
-        used = chain.used + (text, following) if verdict.accepted else chain.used
-        response = game_reply(personality.name, verdict.accepted, verdict.reason, chain.current, text, following)
+        following = (verdict.next_idiom or answer) if verdict.accepted else chain.current
+        used = chain.used
+        if verdict.accepted:
+            used += (answer,)
+            if verdict.next_idiom:
+                used += (following,)
+        if verdict.accepted and not verdict.next_idiom:
+            response = (f"接得漂亮！{chain.current} → {answer}\n"
+                        f"这轮我没接上，大家继续接以“{answer[-1]}”开头的四字成语。")
+        else:
+            response = game_reply(personality.name, verdict.accepted, verdict.reason, chain.current, answer, following)
         if ctx.reply_at(message, response, display_name=name, delivery_guard=guard):
             game.chain = Chain(following, used, time.monotonic())
             game.updated_at = time.monotonic()
+            self._save(ctx, room)
