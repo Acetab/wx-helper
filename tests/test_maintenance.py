@@ -208,6 +208,29 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(notice.status(), "sent")
         self.assertEqual(len(self.backend.sent), 1)
 
+    def test_startup_notice_reannounces_after_text_changes(self):
+        k = self.kb()
+        options = {"id": "test-version", "room": ROOM, "text": "第一版更新说明。"}
+        self.assertTrue(StartupNotice(k, self.service, options).send())
+        self.assertFalse(StartupNotice(k, self.service, options).send())
+        changed = {**options, "text": "第二版更新说明，这次修好了成语接龙。"}
+        self.assertTrue(StartupNotice(k, self.service, changed).send())
+        self.assertFalse(StartupNotice(k, self.service, changed).send())
+        self.assertEqual(len(self.backend.sent), 2)
+        self.assertEqual(self.backend.sent[-1][1], changed["text"])
+
+    def test_notice_status_and_retry_use_the_text_version_key(self):
+        k = self.kb()
+        options = {"id": "test-version", "room": ROOM, "text": "第一版更新说明。"}
+        notice = StartupNotice(k, self.service, options)
+        self.assertEqual(notice.status(), "pending")
+        self.assertTrue(notice.send())
+        self.assertEqual(notice.status(), "sent")
+        notice.retry()
+        self.assertEqual(notice.status(), "pending")
+        self.assertTrue(notice.send())
+        self.assertEqual(len(self.backend.sent), 2)
+
     def test_notice_unknown_result_does_not_automatically_repeat(self):
         k = self.kb()
         options = {"id": "uncertain", "room": ROOM, "text": "更新完成。"}

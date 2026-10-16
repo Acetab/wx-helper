@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from pathlib import Path
 
@@ -123,20 +124,25 @@ def apply_upgrade(knowledge, path):
 
 
 class StartupNotice:
+    """首次启动公告：公告 ID 与正文哈希共同构成版本键，正文一变就重新公告一次。"""
+
     def __init__(self, knowledge, service, options):
         self.knowledge, self.service, self.options = knowledge, service, options
+        digest = hashlib.sha256(options["text"].encode("utf-8")).hexdigest()[:12]
+        self.notice_id = f"{options['id']}#{digest}"
 
     def status(self):
         k, o = self.knowledge, self.options
         with k._lock:
             row = k._db().execute("SELECT status FROM startup_notices WHERE account=? AND room=? AND notice_id=?",
-                                  (k.account, o["room"], o["id"])).fetchone()
+                                  (k.account, o["room"], self.notice_id)).fetchone()
             return row[0] if row else "pending"
 
     def retry(self):
         k, o = self.knowledge, self.options
         with k._lock, k._db() as db:
-            db.execute("DELETE FROM startup_notices WHERE account=? AND room=? AND notice_id=?", (k.account, o["room"], o["id"]))
+            db.execute("DELETE FROM startup_notices WHERE account=? AND room=? AND notice_id=?",
+                       (k.account, o["room"], self.notice_id))
 
     def send(self):
         k, o, session = self.knowledge, self.options, self.service.session_id
@@ -145,7 +151,7 @@ class StartupNotice:
         k._room(o["room"])
         with k._lock, k._db() as db:
             claimed = db.execute("INSERT OR IGNORE INTO startup_notices VALUES(?,?,?,'sending',?)",
-                                  (k.account, o["room"], o["id"], k.now())).rowcount
+                                  (k.account, o["room"], self.notice_id, k.now())).rowcount
             if not claimed:
                 return False
         status = "unknown"
@@ -159,4 +165,4 @@ class StartupNotice:
         finally:
             with k._lock, k._db() as db:
                 db.execute("UPDATE startup_notices SET status=?,updated_at=? WHERE account=? AND room=? AND notice_id=?",
-                           (status, k.now(), k.account, o["room"], o["id"]))
+                           (status, k.now(), k.account, o["room"], self.notice_id))
