@@ -1,5 +1,5 @@
 # 微信文本机器人框架
-项目已在linux.do公开声明https://linux.do/
+项目已在linux.do公开声明[https://linux.do/](https://linux.do/t/topic/3029497/51)
 
 
 面向 Windows x64、微信 4.1.15.13 的 Python 插件框架。统一入口为 `main.py`，原生桥接负责文本收发，功能以插件加载。
