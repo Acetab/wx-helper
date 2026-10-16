@@ -213,7 +213,9 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
 
         if mode in ("--arm", "--dispatch", "--receive", "--listen", "--probe-at"):
             existing = dll.name.lower() in loaded_modules
-            if existing and not keep_loaded: raise RuntimeError("桥接 DLL 已加载，请先清理")
+            if existing and not keep_loaded:
+                raise RuntimeError("微信进程中已有桥接 DLL；请先在旧机器人输入 quit 并等待框架停止。"
+                                   "若旧实例已退出，运行 python tools/recover_bridge.py 清理后再启动")
             if not existing:
                 if keep_loaded: raise RuntimeError("接收服务的桥接 DLL 已卸载")
                 dll_parameter = allocate((str(dll) + "\0").encode("utf-16-le"))

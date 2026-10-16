@@ -5,6 +5,7 @@ import json
 import logging
 import queue
 import shlex
+import signal
 import sys
 import threading
 import time
@@ -174,6 +175,8 @@ class BotApplication:
             pass
 
     def _start_background(self):
+        if self.stop_event.is_set():
+            return
         if not (self.memory_options["enabled"] or self.hourly_options["enabled"]):
             return
         if self.members is None or not self.members.history_enabled or self.members.daily_clear:
@@ -195,6 +198,8 @@ class BotApplication:
 
     def update_feature(self, section, changes):
         with self._background_lock:
+            if self.stop_event.is_set():
+                raise ValueError("机器人正在退出，未修改后台设置")
             candidate = dict(self.config)
             candidate[section] = {**candidate.get(section, {}), **changes}
             self.store.validate(candidate)
@@ -271,18 +276,37 @@ class BotApplication:
             self.stop()
 
     def stop(self):
-        self.stop_event.set()
-        self.service.cancel_pending()
-        if self.maintenance_router:
-            self.maintenance_router.close()
-        if self.hourly_scheduler:
-            self.hourly_scheduler.close()
-        if self.memory_worker:
-            self.memory_worker.close()
-        self.plugins.shutdown()
-        cleaned = self._disconnect()
-        if self.members is not None:
-            self.members.close()
-        if not cleaned:
-            raise RuntimeError("原生连接未能清理；保留 DLL，请查看日志后再启动")
-        logger.info("框架已停止；连接清理：%s", self.last_cleanup)
+        previous_interrupt = None
+        if threading.current_thread() is threading.main_thread():
+            previous_interrupt = signal.signal(signal.SIGINT, lambda *_: logger.warning("正在清理退出，请等待，不要关闭窗口"))
+        try:
+            self.stop_event.set()
+            self.service.cancel_pending()
+            # 先撤销微信 Hook，后台线程等待或退出失败也不会跳过原生清理。
+            logger.info("正在退出：先停止微信接收并清理桥接，再等待后台任务结束")
+            cleaned = self._disconnect()
+            failures = []
+            for name, attribute in (("维护", "maintenance_router"), ("定时", "hourly_scheduler"), ("记忆", "memory_worker")):
+                worker = getattr(self, attribute)
+                if worker:
+                    try:
+                        worker.close()
+                    except Exception as error:
+                        failures.append(name)
+                        logger.error("%s线程退出未完成：%s", name, type(error).__name__)
+            try:
+                self.plugins.shutdown()
+            except Exception as error:
+                failures.append("插件")
+                logger.error("插件退出未完成：%s", type(error).__name__)
+            # 尚存后台线程可能仍用数据库，不能强行关闭其连接。
+            if self.members is not None and not failures and cleaned:
+                self.members.close()
+            if not cleaned:
+                raise RuntimeError("原生连接未能清理；待机器人退出后运行 python tools/recover_bridge.py")
+            if failures:
+                raise RuntimeError("桥接已清理，但这些后台任务尚未退出：" + "、".join(failures))
+            logger.info("框架已停止；连接清理：%s", self.last_cleanup)
+        finally:
+            if previous_interrupt is not None:
+                signal.signal(signal.SIGINT, previous_interrupt)
