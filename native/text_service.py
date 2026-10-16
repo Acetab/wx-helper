@@ -11,7 +11,7 @@ from wxbot_framework.mentions import parse_at_members
 from run_selftest import TEXT_DLL, K, check, modules, wechat_candidates, run
 from wxbot_framework.text import TextRouter, validate_target, validate_mentions
 from wxbot_framework.account import read_current_account, read_current_profile, select_account_process, validate_account
-from wxbot_framework.contacts import read_contact_name
+from wxbot_framework.contacts import read_chatroom_members, read_contact_name
 
 logger = logging.getLogger("NativeText")
 
@@ -116,6 +116,18 @@ class NativeTextService(NativeFileHelperService):
             name = profile["name"] if profile and profile["wxid"] == wxid else None
         return name
 
+    def read_room_directory(self, room_wxid):
+        if self._channel is None:
+            return (), {}
+        members = read_chatroom_members(self._channel.read_memory, self._channel.core_base, room_wxid,
+                                        expected_account=self.self_wxid)
+        names = {}
+        for wxid in members:
+            name = self._sender_wechat_name(wxid)
+            if name:
+                names[wxid] = name
+        return members, names
+
     def _map_message(self, message):
         if message.type != 1:
             return None
@@ -132,6 +144,14 @@ class NativeTextService(NativeFileHelperService):
                 data["sender_wechat_name"] = name
             source = getattr(message, "mention_source", b"").decode("utf-8", errors="replace")
             data["at_members"] = parse_at_members(source)
+            if data["at_members"]:
+                at_names = {}
+                for wxid in data["at_members"]:
+                    at_name = self._sender_wechat_name(wxid)
+                    if at_name:
+                        at_names[wxid] = at_name
+                if at_names:
+                    data["at_member_names"] = at_names
             data["is_at_self"] = bool(data["room_wxid"] and self.self_wxid in data["at_members"])
             if data["at_members"]:
                 self.mention_messages += 1

@@ -2,9 +2,12 @@
 from wxbot_framework.dialogue import Dialogue
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import SnapshotExpired
+from wxbot_framework.mentions import strip_at_labels
 from wxbot_framework.personality import personality_text
 from wxbot_framework.summary import split_text
 from wxbot_framework.commands import is_control
+
+SELF_QUERY_HINTS = ("我是谁", "知道我是谁", "认识我吗", "我叫什么", "我的身份", "我是哪位")
 
 
 class Plugin:
@@ -26,16 +29,19 @@ class Plugin:
             snapshot = self.members.conversation_snapshot(message)
             guard = lambda: ctx.response_guard(snapshot, personality)
             entity = ctx.knowledge.member_entity(message.chat_id, message.sender_id)
-            own = ctx.knowledge.search(message.chat_id, "", entity_id=entity["id"], limit=3, char_limit=1500)
-            relevant = ctx.knowledge.search(message.chat_id, message.text, limit=5, char_limit=2500)
+            profile = ctx.knowledge.speaker_profile(message.chat_id, message.sender_id)
+            clean_query = strip_at_labels(message.text).strip()
+            own = ctx.knowledge.search(message.chat_id, "", entity_id=entity["id"], limit=5, char_limit=1800)
+            if len(clean_query) <= 12 and any(hint in clean_query for hint in SELF_QUERY_HINTS):
+                relevant = []
+            else:
+                relevant = ctx.knowledge.search(message.chat_id, clean_query, limit=4, char_limit=2000)
             knowledge = list({item["id"]: item for item in own + relevant}.values())
             style = ctx.knowledge.style(message.chat_id, message.sender_id)
             reply = personality_text(Dialogue(ctx.llm_for(message, personality=personality)).reply(snapshot,
-                                     knowledge=knowledge, style=style),
+                                     knowledge=knowledge, style=style, speaker_profile=profile),
                                      personality.name)
-            if self.members.binding_reminder_due(message.chat_id, message.sender_id):
-                reply += "\n可发送 /绑定 昵称，让机器人记住本群称呼。"
-            display = self.members.display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
+            display = self.members.at_display_name(message.sender_id, message.chat_id) or snapshot.speaker_name
             budget = 1023 - len(("@" + display + "\u2005\n").encode("utf-8"))
             for part in split_text(reply, byte_limit=budget):
                 if not ctx.reply_at(message, part, display_name=display, delivery_guard=guard):

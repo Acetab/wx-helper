@@ -7,7 +7,7 @@ import re
 from datetime import timezone
 from pathlib import Path
 
-from .members import MemberError, name_key
+from .members import MemberError, name_key, parse_aliases, parse_json_list
 from .memory_schema import initialize_schema
 from .commands import effective_text
 from .knowledge_admin import KnowledgeAdminMixin
@@ -69,11 +69,30 @@ class KnowledgeStore(KnowledgeAdminMixin):
     def initialize(self, seed_file=None, *, upgrade_file=None):
         with self._lock:
             initialize_schema(self.members._connection(), self.members.path)
+            self._heal_json_columns()
         if upgrade_file and Path(upgrade_file).is_file():
             from .upgrades import apply_upgrade
             apply_upgrade(self, upgrade_file)
         if seed_file and Path(seed_file).is_file():
             self.import_seed(seed_file)
+
+    def _heal_json_columns(self):
+        """自愈手动改库导致的空串、大小写未归一或非规范 JSON 列表，并自动标记人工修订。"""
+        with self._db() as db:
+            for row in db.execute("SELECT id, room, name, entity_key, aliases, wxid FROM knowledge_entities WHERE account=?",
+                                  (self.account,)).fetchall():
+                cleaned = [alias for alias in sorted(parse_aliases(row["aliases"])) if alias != name_key(row["name"])]
+                canonical = json.dumps(cleaned, ensure_ascii=False)
+                if row["aliases"] != canonical:
+                    db.execute("UPDATE knowledge_entities SET aliases=?,aliases_manual=1 WHERE id=?",
+                               (canonical, row["id"]))
+                    if row["wxid"] and row["entity_key"].startswith("person:"):
+                        self.sync_person_member(row["room"], row["id"])
+            for row in db.execute("SELECT id, tags FROM knowledge_items WHERE account=?", (self.account,)).fetchall():
+                cleaned_tags = parse_json_list(row["tags"])[:10]
+                canonical_tags = json.dumps(cleaned_tags, ensure_ascii=False)
+                if row["tags"] != canonical_tags:
+                    db.execute("UPDATE knowledge_items SET tags=? WHERE id=?", (canonical_tags, row["id"]))
 
     def _db(self):
         return self.members._connection()
@@ -94,12 +113,12 @@ class KnowledgeStore(KnowledgeAdminMixin):
                                   (self.account, room, key)).fetchone()
             if existing is None:
                 matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and
-                           name_key(name) in {name_key(e["name"]), *json.loads(e["aliases"])}]
+                           name_key(name) in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
                 if len(matches) == 1:
                     existing = matches[0]
                     key = existing["entity_key"]
             if existing and existing["aliases_manual"]:
-                clean = json.loads(existing["aliases"])
+                clean = parse_aliases(existing["aliases"])
             if existing:
                 blocked = {r[0] for r in db.execute("SELECT alias FROM knowledge_alias_blocks WHERE entity_id=?",
                                                     (existing["id"],))}
@@ -110,7 +129,7 @@ class KnowledgeStore(KnowledgeAdminMixin):
                 (self.account, room, key, name.strip(), json.dumps(clean, ensure_ascii=False), int(pinned)))
             row = db.execute("SELECT * FROM knowledge_entities WHERE account=? AND room=? AND entity_key=?",
                              (self.account, room, key)).fetchone()
-            merged = sorted(set(json.loads(row["aliases"])) | set(clean))
+            merged = sorted(set(parse_aliases(row["aliases"])) | set(clean))
             db.execute("UPDATE knowledge_entities SET aliases=?,pinned=MAX(pinned,?) WHERE id=?",
                        (json.dumps(merged, ensure_ascii=False), int(pinned), row["id"]))
             return dict(db.execute("SELECT * FROM knowledge_entities WHERE id=?", (row["id"],)).fetchone())
@@ -145,7 +164,7 @@ class KnowledgeStore(KnowledgeAdminMixin):
         key = name_key(name)
         with self._lock:
             self._room(room)
-            matches = [e for e in self._entities(room) if key in {e["name"].casefold(), *json.loads(e["aliases"])}]
+            matches = [e for e in self._entities(room) if key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
             # 明确绑定的称呼优先作为成员查询；不据此关联同名空间人物。
             try:
                 member = self.members.resolve(name, room)
@@ -163,45 +182,89 @@ class KnowledgeStore(KnowledgeAdminMixin):
         with self._lock:
             self._room(room)
             matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and
-                       key in {e["name"].casefold(), *json.loads(e["aliases"])}]
+                       key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
             if len(matches) != 1:
                 raise MemberError("未找到唯一人物")
             return matches[0]
 
-    def link(self, room, wxid, name, editor):
+    def link(self, room, wxid, name, editor, *, create_if_missing=False, replace=False):
         if not self.members.is_admin(editor):
             raise MemberError("只有管理员可以关联人物")
+        from .text import validate_mentions
+        validate_mentions(room, [wxid])
         with self._lock:
+            self._room(room)
+            now = self.now()
+            with self._db() as db:
+                db.execute("""INSERT INTO room_members(account,room,wxid,first_seen,last_seen) VALUES(?,?,?,?,?)
+                    ON CONFLICT(account,room,wxid) DO UPDATE SET first_seen=COALESCE(room_members.first_seen,excluded.first_seen)""",
+                    (self.account, room, wxid, now, now))
             # 关联目标只取人物档案，不按刚绑定的同名微信昵称替换。
-            key = name_key(name)
-            matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and
-                       key in {e["name"].casefold(), *json.loads(e["aliases"])}]
+            token = str(name).strip()
+            if token.startswith("#") and token[1:].isdigit():
+                matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and e["id"] == int(token[1:])]
+            else:
+                key = name_key(token)
+                matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and
+                           key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
+            if not matches and create_if_missing:
+                matches = [self.entity(room, token, pinned=True)]
             if len(matches) != 1:
                 raise MemberError("请指定唯一的已有空间人物或高频人物")
             target = matches[0]
             if target["wxid"] and target["wxid"] != wxid:
-                raise MemberError("该人物已关联其他 ID，未修改原关联")
+                if not replace:
+                    raise MemberError("该人物已关联其他 ID，未修改原关联")
             old = self.member_entity(room, wxid)
             if old["id"] == target["id"]:
-                return target
+                with self._db():
+                    self.sync_person_member(room, target["id"])
+                return self.member_entity(room, wxid)
             if old["entity_key"].startswith("person:"):
-                raise MemberError("该成员已关联另一人物，请先核对，不能自动合并")
+                if not replace:
+                    raise MemberError("该成员已关联另一人物，请先核对，不能自动合并")
             with self._db() as db:
-                for item in db.execute("SELECT * FROM knowledge_items WHERE entity_id=?", (old["id"],)).fetchall():
-                    conflict = db.execute("SELECT 1 FROM knowledge_items WHERE entity_id=? AND slot=?",
-                                          (target["id"], item["slot"])).fetchone()
-                    slot = item["slot"] + f"（成员记录{item['id']}）" if conflict else item["slot"]
-                    active_epoch = item["epoch"] == old["epoch"]
-                    db.execute("UPDATE knowledge_items SET entity_id=?,slot=?,epoch=?,status=? WHERE id=?",
-                               (target["id"], slot, target["epoch"] if active_epoch else -item["id"],
-                                item["status"] if active_epoch else "archived", item["id"]))
-                db.execute("UPDATE OR IGNORE knowledge_mentions SET entity_id=? WHERE entity_id=?", (target["id"], old["id"]))
-                db.execute("DELETE FROM knowledge_mentions WHERE entity_id=?", (old["id"],))
-                db.execute("UPDATE OR REPLACE member_styles SET entity_id=? WHERE entity_id=?", (target["id"], old["id"]))
-                db.execute("DELETE FROM knowledge_entities WHERE id=?", (old["id"],))
+                previous_target_wxid = target["wxid"]
+                if old["entity_key"].startswith("person:"):
+                    db.execute("UPDATE knowledge_entities SET wxid=NULL WHERE id=?", (old["id"],))
+                    self.sync_person_member(room, old["id"], previous_wxid=wxid)
+                else:
+                    for item in db.execute("SELECT * FROM knowledge_items WHERE entity_id=?", (old["id"],)).fetchall():
+                        conflict = db.execute("SELECT 1 FROM knowledge_items WHERE entity_id=? AND slot=?",
+                                              (target["id"], item["slot"])).fetchone()
+                        slot = item["slot"] + f"（成员记录{item['id']}）" if conflict else item["slot"]
+                        active_epoch = item["epoch"] == old["epoch"]
+                        db.execute("UPDATE knowledge_items SET entity_id=?,slot=?,epoch=?,status=? WHERE id=?",
+                                   (target["id"], slot, target["epoch"] if active_epoch else -item["id"],
+                                    item["status"] if active_epoch else "archived", item["id"]))
+                    db.execute("UPDATE OR IGNORE knowledge_mentions SET entity_id=? WHERE entity_id=?", (target["id"], old["id"]))
+                    db.execute("DELETE FROM knowledge_mentions WHERE entity_id=?", (old["id"],))
+                    db.execute("UPDATE OR REPLACE member_styles SET entity_id=? WHERE entity_id=?", (target["id"], old["id"]))
+                    db.execute("DELETE FROM knowledge_entities WHERE id=?", (old["id"],))
                 db.execute("UPDATE knowledge_entities SET wxid=?,pinned=1 WHERE id=?", (wxid, target["id"]))
+                self.sync_person_member(room, target["id"], previous_wxid=previous_target_wxid)
                 self.entity_audit(room, target["id"], editor, "link", target, {"wxid": wxid, "member_entity": old["id"]})
             return self.member_entity(room, wxid)
+
+    def speaker_profile(self, room, wxid):
+        self._room(room)
+        with self._lock:
+            entity = self.member_entity(room, wxid)
+            wechat = self.members.wechat_name(wxid)
+            if entity["entity_key"].startswith("person:"):
+                return {
+                    "bound": True,
+                    "name": entity["name"],
+                    "aliases": parse_aliases(entity["aliases"]),
+                    "wechat_name": wechat,
+                }
+            safe_name = self.members.safe_wechat_name(wxid, room)
+            return {
+                "bound": False,
+                "name": safe_name or "群友",
+                "aliases": [],
+                "wechat_name": safe_name,
+            }
 
     def put(self, room, entity_id, slot, kind, content, *, tags=(), sources=(), origin=None, expected_epoch=None):
         """自动写入只更新非人工、非遗忘条目；调用方负责事务边界。"""
@@ -254,13 +317,23 @@ class KnowledgeStore(KnowledgeAdminMixin):
             if room not in self.members.groups:
                 continue
             for profile in profiles:
-                entity = self.entity(room, profile["name"], aliases=profile.get("aliases", []), pinned=True)
+                profile_key = name_key(profile["name"])
+                claimed_elsewhere = set()
+                for row in self._entities(room):
+                    if not row["entity_key"].startswith("person:"):
+                        continue
+                    row_names = {name_key(row["name"]), *parse_aliases(row["aliases"])}
+                    if profile_key in row_names:
+                        continue
+                    claimed_elsewhere.update(row_names)
+                seed_aliases = [alias for alias in profile.get("aliases", []) if name_key(alias) not in claimed_elsewhere]
+                entity = self.entity(room, profile["name"], aliases=seed_aliases, pinned=True)
                 with self._lock, self._db():
                     for entry in profile.get("memories", []):
                         kind = entry.get("kind", "群内玩笑")
                         item_id = self.put(room, entity["id"], entry["key"], kind, entry["content"],
                                            tags=entry.get("tags", []), origin="seed:" + digest + ":" + entry["key"])
-                        if item_id and kind == "人工确认":
+                        if item_id:
                             self._db().execute("UPDATE knowledge_items SET manual=1 WHERE id=?", (item_id,))
 
     def cursor(self, room):
@@ -321,10 +394,10 @@ class KnowledgeStore(KnowledgeAdminMixin):
                     continue
                 if not self.visible(entity) or (entity_id is not None and entity["id"] != entity_id):
                     continue
-                aliases = [entity["name"].casefold(), *json.loads(entity["aliases"])]
+                aliases = [name_key(entity["name"]), *parse_aliases(entity["aliases"])]
                 score = 100 if entity_id == entity["id"] else 0
                 score += 30 * sum(len(alias) >= 2 and alias in query for alias in aliases)
-                score += 8 * sum(tag.casefold() in query for tag in json.loads(row["tags"]))
+                score += 8 * sum(tag.casefold() in query for tag in parse_json_list(row["tags"]))
                 score += sum(token in row["content"].casefold() for token in tokens)
                 if query and query in row["content"].casefold():
                     score += 20
@@ -332,7 +405,10 @@ class KnowledgeStore(KnowledgeAdminMixin):
                     score += 1
                 if score:
                     item = dict(row)
-                    item["name"] = (self.members.display_name(entity["wxid"], room) if entity["wxid"] else None) or entity["name"]
+                    if entity["entity_key"].startswith("person:"):
+                        item["name"] = entity["name"]
+                    else:
+                        item["name"] = (self.members.display_name(entity["wxid"], room) if entity["wxid"] else None) or entity["name"]
                     item["sources"] = [dict(source) for source in self._db().execute(
                         "SELECT origin,message_id,source_time FROM knowledge_sources WHERE item_id=? ORDER BY source_time DESC LIMIT 3",
                         (row["id"],))]
@@ -383,14 +459,17 @@ class KnowledgeStore(KnowledgeAdminMixin):
             context = []
             for entity in self._entities(room):
                 if entity["wxid"] and entity["wxid"] not in speakers:
+                    if not entity["pinned"]:
+                        continue
+                if not entity["wxid"] and not entity["pinned"] and not self.visible(entity):
                     continue
                 topics = [dict(row) for row in self._db().execute(
-                    "SELECT slot AS key,status,manual FROM knowledge_items WHERE entity_id=? AND epoch=? ORDER BY manual DESC,id DESC LIMIT 12",
+                    "SELECT slot AS key,status,manual FROM knowledge_items WHERE entity_id=? AND epoch=? ORDER BY manual DESC,id DESC LIMIT 8",
                     (entity["id"], entity["epoch"]))]
-                context.append({"name": entity["name"], "aliases": json.loads(entity["aliases"]),
+                context.append({"name": entity["name"], "aliases": parse_aliases(entity["aliases"]),
                                 "speaker": speakers.get(entity["wxid"]), "topics": topics,
                                 "learning_after_message_id": entity["learning_floor"]})
-            return context[:100]
+            return context[:40]
 
     def status(self):
         with self._lock:

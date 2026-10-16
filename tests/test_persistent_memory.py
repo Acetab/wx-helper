@@ -153,6 +153,23 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(items[0]["sources"][0]["origin"].startswith("seed:"))
         self.assertEqual(items[0]["revision"], revision)
 
+    def test_manual_sqlite_alias_edits_self_heal_on_initialize(self):
+        kb = self.kb()
+        seed = self.root / "seed.json"
+        seed.write_text(json.dumps({"groups": {ROOM: [
+            {"name": "人物甲", "aliases": ["外号A"], "memories": []},
+            {"name": "人物乙", "aliases": ["外号B"], "memories": []},
+        ]}}), encoding="utf-8")
+        kb.import_seed(seed)
+        with kb._lock, kb._db() as db:
+            db.execute("UPDATE knowledge_entities SET aliases='' WHERE account=? AND room=? AND name='人物甲'", (ROBOT, ROOM))
+            db.execute("""UPDATE knowledge_entities SET aliases='["Zeg", "外号A", "外号B"]'
+                WHERE account=? AND room=? AND name='人物乙'""", (ROBOT, ROOM))
+        kb.initialize(seed)
+        self.assertEqual(kb.find_person(ROOM, "Zeg")["name"], "人物乙")
+        self.assertEqual(kb.find_person(ROOM, "外号A")["name"], "人物乙")
+        self.assertEqual(json.loads(kb.find_person(ROOM, "人物甲")["aliases"]), [])
+
     def test_import_promotes_existing_candidate_and_adds_explicit_alias(self):
         kb = self.kb()
         candidate = kb.entity(ROOM, "新人物")

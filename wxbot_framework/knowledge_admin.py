@@ -6,7 +6,7 @@ import json
 import secrets
 
 from .authorization import editor_label
-from .members import MemberError, name_key
+from .members import MemberError, name_key, parse_aliases
 
 
 class KnowledgeAdminMixin:
@@ -23,7 +23,7 @@ class KnowledgeAdminMixin:
         for entity in self._entities(room):
             if entity["id"] == entity_id or not entity["entity_key"].startswith("person:"):
                 continue
-            existing = {name_key(entity["name"]), *json.loads(entity["aliases"])}
+            existing = {name_key(entity["name"]), *parse_aliases(entity["aliases"])}
             if names & existing:
                 raise MemberError("人物主名或别名已属于另一人物，请先核对归属")
 
@@ -48,6 +48,47 @@ class KnowledgeAdminMixin:
              json.dumps(previous, ensure_ascii=False), json.dumps(replacement, ensure_ascii=False), self.now()))
         self.invalidate(room)
 
+    def sync_person_member(self, room, entity_id, *, previous_key=None, previous_wxid=None):
+        db = self._db()
+        entity = db.execute("SELECT * FROM knowledge_entities WHERE id=? AND account=? AND room=?",
+                            (entity_id, self.account, room)).fetchone()
+        all_aliases = set()
+        if entity and entity["entity_key"].startswith("person:"):
+            all_aliases = {name_key(entity["name"]), *parse_aliases(entity["aliases"])}
+        keys_to_clear = set()
+        if previous_key:
+            keys_to_clear.add(previous_key)
+        if entity:
+            keys_to_clear.add(entity["entity_key"])
+        for wxid in (previous_wxid, entity["wxid"] if entity else None):
+            if wxid:
+                for row in db.execute("SELECT person_key FROM people WHERE account=? AND room=? AND wxid=?",
+                                      (self.account, room, wxid)).fetchall():
+                    keys_to_clear.add(row["person_key"])
+        if all_aliases:
+            placeholders = ",".join("?" for _ in all_aliases)
+            for row in db.execute(f"""SELECT DISTINCT p.person_key FROM people p
+                LEFT JOIN aliases a USING(account,room,person_key)
+                WHERE p.account=? AND p.room=? AND (p.wxid IS NULL OR p.wxid=?)
+                AND a.alias IN ({placeholders})""",
+                (self.account, room, entity["wxid"], *all_aliases)).fetchall():
+                keys_to_clear.add(row["person_key"])
+            for key in tuple(keys_to_clear):
+                for row in db.execute("SELECT alias FROM aliases WHERE account=? AND room=? AND person_key=?",
+                                      (self.account, room, key)).fetchall():
+                    all_aliases.add(row["alias"])
+        for key in keys_to_clear:
+            db.execute("DELETE FROM aliases WHERE account=? AND room=? AND person_key=?", (self.account, room, key))
+            db.execute("DELETE FROM people WHERE account=? AND room=? AND person_key=?", (self.account, room, key))
+        if entity and entity["wxid"] and entity["entity_key"].startswith("person:"):
+            person_key = entity["entity_key"]
+            db.execute("""INSERT INTO people(account,room,person_key,name,display_name,wxid,self_named)
+                VALUES(?,?,?,?,?,?,0)""",
+                (self.account, room, person_key, entity["name"], entity["name"], entity["wxid"]))
+            for alias in sorted(all_aliases):
+                db.execute("INSERT OR REPLACE INTO aliases(account,room,alias,person_key) VALUES(?,?,?,?)",
+                           (self.account, room, alias, person_key))
+
     def change_identity(self, room, value, editor, *, name=None, alias=None, remove=False, unlink=False):
         self.require_editor(editor)
         with self._lock, self._db() as db:
@@ -55,7 +96,7 @@ class KnowledgeAdminMixin:
             before = dict(entity)
             if unlink and not entity["entity_key"].startswith("person:"):
                 raise MemberError("这个档案本身是微信成员记录，没有可解除的人物关联")
-            aliases = set(json.loads(entity["aliases"]))
+            aliases = set(parse_aliases(entity["aliases"]))
             if name is not None:
                 name_key(name)
                 if not entity["entity_key"].startswith("person:"):
@@ -78,6 +119,7 @@ class KnowledgeAdminMixin:
             entity["aliases"] = json.dumps(sorted(aliases), ensure_ascii=False)
             db.execute("UPDATE knowledge_entities SET name=?,entity_key=?,aliases=?,wxid=?,aliases_manual=1 WHERE id=?",
                        (entity["name"], entity["entity_key"], entity["aliases"], entity["wxid"], entity["id"]))
+            self.sync_person_member(room, entity["id"], previous_key=before["entity_key"], previous_wxid=before["wxid"])
             self.entity_audit(room, entity["id"], editor, "identity", before, entity)
             return entity
 

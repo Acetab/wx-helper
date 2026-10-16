@@ -320,6 +320,33 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaises(MemberError):
             k.find_person(ROOM, "旧连接人物")
 
+    def test_flat_admin_commands_bind_alias_rename_remember_and_unbind(self):
+        k = self.kb()
+        service = MaintenanceService(k, options={"default_room": ROOM})
+        router = MaintenanceRouter(service, self.service)
+        self.store.record(self.message("大家好", sender=OTHER, data={"sender_wechat_name": "示例微信昵称", "self_wxid": ROBOT}))
+        # 1. /成员 查看 M 编号
+        router.process(Message("/成员", OWNER, sender_id=OWNER, session_id="test"))
+        self.assertIn("示例微信昵称", self.backend.sent[-1][1])
+        # 2. /绑定 通过微信昵称一步绑定并自动创建人物，同时同步 people 与 aliases
+        router.process(Message("/绑定 示例微信昵称 示例人物乙", OWNER, sender_id=OWNER, session_id="test"))
+        self.assertIn("已绑定", self.backend.sent[-1][1])
+        self.assertEqual(self.store.display_name(OTHER, ROOM), "示例人物乙")
+        self.assertEqual(self.store.at_display_name(OTHER, ROOM), "示例微信昵称")
+        # 3. /别名 添加外号并同步到 MemberStore.resolve
+        router.process(Message("/别名 示例人物乙 +乙哥", OWNER, sender_id=OWNER, session_id="test"))
+        self.assertEqual(self.store.resolve("乙哥", ROOM).wxid, OTHER)
+        # 4. /记住 新增人工记忆
+        router.process(Message('/记住 示例人物乙 长语音 群内玩笑 "喜欢发超长语音"', OWNER, sender_id=OWNER, session_id="test"))
+        self.assertEqual(k.search(ROOM, "长语音")[0]["name"], "示例人物乙")
+        # 5. /人物 查看详情
+        router.process(Message("/人物 示例人物乙", OWNER, sender_id=OWNER, session_id="test"))
+        self.assertIn("示例微信昵称", self.backend.sent[-1][1])
+        # 6. /解绑 解除微信绑定，保留人物资料
+        router.process(Message("/解绑 示例人物乙", OWNER, sender_id=OWNER, session_id="test"))
+        self.assertIsNone(k.find_person(ROOM, "示例人物乙")["wxid"])
+        self.assertIsNone(self.store.find_by_wxid(OTHER, ROOM))
+
 
 if __name__ == "__main__":
     unittest.main()

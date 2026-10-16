@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from plugins.member_identity import Plugin
-from wxbot_framework.members import MemberError, MemberStore
+from wxbot_framework.knowledge import KnowledgeStore
+from wxbot_framework.members import MemberError, MemberStore, name_key
 from wxbot_framework.sdk import Message, PluginContext, ServiceFacade
 from wxbot_framework.runtime import BotApplication
 from wxbot_framework.config import ConfigStore
@@ -26,7 +27,7 @@ class MemberTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=SCRATCH)
         self.root = Path(self.temporary.name).resolve()
         self.assertTrue(self.root.is_relative_to(SCRATCH.resolve()))
-        self.options = {"database_file": "data.sqlite3", "history_enabled": True,
+        self.options = {"database_file": "data.sqlite3", "history_enabled": True, "owner_wxid": SMALL,
                         "groups": {ROOM: [
                             {"key": "xiaomei", "name": "成员甲", "display_name": "成员甲昵称", "aliases": ["小号"], "wxid": SMALL},
                             {"key": "jing", "name": "成员乙", "display_name": "成员乙群名", "aliases": ["成员乙别名"], "wxid": None},
@@ -170,14 +171,18 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(len(self.store.history("成员乙")), 12)
 
     def test_identity_plugin_binds_actual_message_author(self):
-        ctx = Mock(members=self.store, logger=logging.getLogger("MembersTest"))
+        kb = KnowledgeStore(self.store)
+        kb.initialize()
+        ctx = Mock(members=self.store, knowledge=kb, logger=logging.getLogger("MembersTest"))
         plugin = Plugin()
         plugin.on_load(ctx)
+        # 非管理员群友尝试自助绑定时提示已自动识别微信昵称
         plugin.on_message(self.message("/绑定 成员乙"), ctx)
+        self.assertIn("管理员", ctx.reply.call_args.args[1])
+        self.assertIsNone(self.store.resolve("成员乙").wxid)
+        # 管理员使用 /绑定 @群友 人物名 完成统一绑定
+        plugin.on_message(self.message("/绑定 @乙 成员乙", sender=SMALL, data={"at_members": (JING,)}), ctx)
         self.assertEqual(self.store.resolve("成员乙").wxid, JING)
-        ctx.reply.assert_called_once_with(unittest.mock.ANY, "已绑定：成员乙。")
-        plugin.on_message(self.message("/绑定 成员丁"), ctx)
-        self.assertIsNone(self.store.resolve("成员丁").wxid)
 
     def test_context_auto_mention_uses_group_name_instead_of_personal_alias(self):
         self.store.bind("成员乙", ROOM, JING)
@@ -309,12 +314,30 @@ class MemberTests(unittest.TestCase):
         self.assertEqual(store.today_snapshot("指定成员", ROOM).member.wxid, SMALL)
 
     def test_plugin_free_registration_and_usage(self):
-        ctx = Mock(members=self.store, logger=logging.getLogger("MembersTest"))
+        kb = KnowledgeStore(self.store)
+        kb.initialize()
+        ctx = Mock(members=self.store, knowledge=kb, logger=logging.getLogger("MembersTest"))
         plugin = Plugin()
         plugin.on_load(ctx)
-        plugin.on_message(self.message("/绑定 测试成员"), ctx)
+        self.store.record(self.message("先发一句话", sender=JING, data={"sender_wechat_name": "示例微信名", "self_wxid": ROBOT}))
+        plugin.on_message(self.message("/绑定 示例微信名 测试成员", sender=SMALL), ctx)
         self.assertEqual(self.store.resolve("测试成员").wxid, JING)
-        plugin.on_message(self.message("/绑定"), ctx)
-        self.assertEqual(ctx.reply.call_args.args[1], "用法：/绑定 昵称")
-        plugin.on_message(self.message(" /绑定\t成员丙  "), ctx)
-        self.assertEqual(self.store.resolve("成员丙").wxid, JING)
+        self.assertEqual(self.store.at_display_name(JING, ROOM), "示例微信名")
+        self.assertEqual(self.store.display_name(JING, ROOM), "测试成员")
+        plugin.on_message(self.message("/绑定", sender=SMALL), ctx)
+        self.assertIn("用法：/绑定", ctx.reply.call_args.args[1])
+
+    def test_homoglyph_and_anti_impersonation_protection(self):
+        self.assertEqual(name_key("Adminа"), name_key("Admina"))
+        with self.assertRaises(MemberError):
+            name_key("\u3164\u200b")
+        kb = KnowledgeStore(self.store)
+        kb.initialize()
+        kb.entity(ROOM, "示例人物甲", aliases=["Admina", "甲哥"], pinned=True)
+        self.store.remember_wechat_name(SMALL, "Admina")
+        # 未绑定成员把微信名改成 Cyrillic 同形字 Adminа：只记录在 wechat_names，不作为有效显示身份
+        impostor = "wxid_impostor"
+        self.store.record(self.message("猜猜我是谁", sender=impostor, data={"sender_wechat_name": "Adminа", "self_wxid": ROBOT}))
+        self.assertEqual(self.store.wechat_name(impostor), "Adminа")
+        self.assertIsNone(self.store.safe_wechat_name(impostor, ROOM))
+        self.assertIsNone(self.store.display_name(impostor, ROOM))

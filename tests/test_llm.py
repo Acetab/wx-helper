@@ -48,6 +48,16 @@ class LLMTests(unittest.TestCase):
             path.write_text(json.dumps(self.options), encoding="utf-8-sig")
             self.assertEqual(LLMClient.from_file(path).model, "deepseek-flash")
 
+    def test_loopback_http_allowed(self):
+        for base_url in ("http://127.0.0.1:3425/v1", "http://localhost:3425/v1"):
+            with self.subTest(base_url=base_url):
+                self.assertEqual(LLMClient({**self.options, "base_url": base_url}).base_url, base_url)
+
+    def test_remote_http_still_rejected(self):
+        for base_url in ("http://example.com", "http://192.168.1.10:8000/v1"):
+            with self.subTest(base_url=base_url), self.assertRaises(ValueError):
+                LLMClient({**self.options, "base_url": base_url})
+
     def test_invalid_configuration(self):
         for change in ({"api_key": ""}, {"model": 1}, {"base_url": None},
                        {"base_url": "http://example.com"}, {"base_url": "https://user:pass@example.com"},

@@ -22,8 +22,10 @@ class LLMClient:
             raise ValueError("大模型 base_url 必须是 HTTPS 地址字符串")
         self.base_url = base_url.rstrip("/")
         parsed = urlsplit(self.base_url)
-        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("大模型 base_url 应为不含认证信息的 HTTPS 地址")
+        if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("大模型 base_url 应为不含认证信息的 HTTP(S) 地址")
+        if parsed.scheme == "http" and (parsed.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError("非本机地址的大模型 base_url 必须使用 HTTPS")
         self.model = options.get("model", "deepseek-flash")
         self._api_key = options.get("api_key", "")
         if not isinstance(self.model, str) or not self.model.strip():

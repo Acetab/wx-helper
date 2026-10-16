@@ -9,39 +9,47 @@ import threading
 
 from .authorization import LOCAL_EDITOR
 from .commands import command_text
-from .members import MemberError
+from .members import MemberError, parse_aliases
+from .mentions import strip_at_labels
 from .summary import split_text
 from .text import validate_target
 
 logger = logging.getLogger("Maintenance")
-HELP = """维护命令（名字或正文含空格时使用英文双引号）：
+ADMIN_ROOTS = frozenset({
+    "/管理", "/绑定", "/解绑", "/别名", "/改名", "/成员", "/人物", "/记住",
+    "/纠正", "/忘记", "/关联人物", "/清空",
+})
+HELP = """管理员快捷命令（群聊与私聊通用，含空格时用英文双引号）：
+/成员 [未绑定|已绑定|同步]
+/绑定 <@群友|M序号|微信昵称|wxid> <人物名> [--强制]
+/解绑 <@群友|M序号|微信昵称|wxid|人物名>
+/人物 [页码|人物名|#编号]
+/别名 <人物名> <+新别名|-旧别名>
+/改名 <人物名> <新主名>
+/记住 <人物名> <主题> [类别] <内容>
+/纠正 <记忆编号> <新内容>
+/忘记 <记忆编号>
+/清空
+
+完整 /管理 子命令：
 /管理 状态
+/管理 同步
 /管理 群 列表
 /管理 [--群 群ID] 人物 列表 [页码]
-/管理 人物 查看 人物
-/管理 人物 新建 人物
+/管理 人物 查看|新建|解绑|清空|修订 人物
 /管理 人物 改名 人物 新名字
 /管理 人物 关联 人物 微信ID
-/管理 人物 解绑 人物
-/管理 人物 清空 人物
 /管理 确认 操作编号
 /管理 别名 添加|删除 人物 别名
-/管理 成员 列表
-/管理 成员 绑定 微信ID 昵称
+/管理 成员 列表|未绑定|已绑定|同步
 /管理 记忆 列表|历史 人物 [页码]
 /管理 记忆 新增 人物 主题 类别 正文
-/管理 记忆 修改 编号 正文
-/管理 记忆 移动 编号 目标人物
+/管理 记忆 修改|移动|分类 编号 参数
 /管理 记忆 停用|恢复|来源|修订 编号 [页码]
-/管理 记忆 分类 编号 类别
-/管理 人物 修订 人物 [页码]
 /管理 学习 开启|关闭|立即处理
-/管理 定时 开启|关闭
-/管理 定时 设置 开始小时 结束小时 最近条数
-/管理 上下文 清空
+/管理 定时 开启|关闭|设置 开始小时 结束小时 最近条数
 /管理 插件 列表|启用 名称|停用 名称|重载 [名称]
-/管理 公告 状态|重发
-清空人物资料后从新消息继续学习；/清空仅重置对话上下文。"""
+/管理 公告 状态|重发"""
 
 
 def maintenance_options(config):
@@ -85,7 +93,7 @@ class MaintenanceService:
             raise MemberError("目标群不在当前收发范围内")
         return target
 
-    def execute(self, command, editor, *, current_room=None, explicit_room=None):
+    def execute(self, command, editor, *, current_room=None, explicit_room=None, at_members=()):
         self.knowledge.require_editor(editor)
         with self._lock, self.knowledge._lock:
             # 仅解析和快速数据库操作持锁，运行操作由下方独立分支处理。
@@ -97,6 +105,9 @@ class MaintenanceService:
             if words == ["群", "列表"]:
                 return "已配置群：\n" + "\n".join(sorted(self.members.groups))
             room = self.room(explicit_room, current_room)
+            if words == ["同步"]:
+                synced = self.app.sync_wechat_directory(room) if self.app else {"members": 0, "names": 0}
+                return f"已同步微信内存群成员缓存：成员 {synced['members']} 人，有效微信昵称 {synced['names']} 个。"
             if words == ["状态"]:
                 state = {"目标群": room, "知识库": self.knowledge.status(), "已连接": bool(self.app and self.app._connection_ready)}
                 if self.app:
@@ -108,11 +119,19 @@ class MaintenanceService:
             if words == ["上下文", "清空"]:
                 self.members.reset_context(room)
                 return "已重置本群近期对话上下文，聊天原文和长期知识保留。"
+            if words[:1] == ["绑定"]:
+                return self._bind_shortcut(room, words[1:], editor, at_members=at_members)
+            if words[:1] == ["解绑"]:
+                return self._unbind_shortcut(room, words[1:], editor, at_members=at_members)
+            if words[:1] == ["改名"] and len(words) == 3:
+                entity = self.knowledge.change_identity(room, words[1], editor, name=words[2])
+                return f"已将人物改名为 #{entity['id']} {entity['name']}（原名保留为别名）。"
+            if words[:1] == ["记住"] and len(words) >= 4:
+                return self._remember_shortcut(room, words[1:], editor)
             if words[:1] == ["人物"]:
                 return self._people(room, words[1:], editor)
-            if words[:1] == ["别名"] and len(words) == 4 and words[1] in ("添加", "删除"):
-                self.knowledge.change_identity(room, words[2], editor, alias=words[3], remove=words[1] == "删除")
-                return "已更新人物别名并保存操作记录。"
+            if words[:1] == ["别名"]:
+                return self._alias_command(room, words[1:], editor)
             if words[:1] == ["记忆"]:
                 return self._memory(room, words[1:], editor)
             if words[:1] == ["成员"]:
@@ -120,6 +139,86 @@ class MaintenanceService:
         # 启停线程、等待插件退出与发送公告均不能占数据库锁。
         with self._lock:
             return self._runtime(room, words)
+
+    def _bind_shortcut(self, room, words, editor, *, at_members=()):
+        force = False
+        filtered = []
+        for w in words:
+            if w in ("--强制", "强制", "--force"):
+                force = True
+            else:
+                filtered.append(w)
+        targets = [wxid for wxid in at_members if wxid != self.members.account]
+        if targets:
+            if len(targets) != 1 or not filtered:
+                raise MemberError("用法：/绑定 @群友 人物名 [--强制]")
+            wxid = targets[0]
+            person_name = " ".join(filtered).strip()
+        else:
+            if len(filtered) != 2:
+                raise MemberError("用法：/绑定 <@群友|M序号|微信昵称|wxid> <人物名> [--强制]")
+            wxid = self.members.resolve_member_target(room, filtered[0])
+            person_name = filtered[1].strip()
+        entity = self.knowledge.link(room, wxid, person_name, editor, create_if_missing=True, replace=force)
+        wechat = self.members.wechat_name(wxid) or "未缓存微信名"
+        aliases = "、".join(parse_aliases(entity["aliases"])) or "无"
+        return f"已绑定：{wechat}（{wxid}）→ #{entity['id']} {entity['name']}（别名：{aliases}）。"
+
+    def _unbind_shortcut(self, room, words, editor, *, at_members=()):
+        targets = [wxid for wxid in at_members if wxid != self.members.account]
+        if targets:
+            if len(targets) != 1:
+                raise MemberError("一次只能解绑一位群成员")
+            entity = self.knowledge.member_entity(room, targets[0])
+            self.knowledge.change_identity(room, entity["id"], editor, unlink=True)
+            return f"已解除 #{entity['id']} {entity['name']} 的微信身份绑定，人物资料保留。"
+        if len(words) != 1:
+            raise MemberError("用法：/解绑 <@群友|M序号|微信昵称|wxid|人物名>")
+        token = words[0].strip()
+        try:
+            entity = self.knowledge.admin_entity(room, token)
+            if entity["entity_key"].startswith("person:") and entity["wxid"]:
+                self.knowledge.change_identity(room, entity["id"], editor, unlink=True)
+                return f"已解除 #{entity['id']} {entity['name']} 的微信身份绑定，人物资料保留。"
+        except MemberError:
+            pass
+        wxid = self.members.resolve_member_target(room, token)
+        entity = self.knowledge.member_entity(room, wxid)
+        self.knowledge.change_identity(room, entity["id"], editor, unlink=True)
+        return f"已解除 #{entity['id']} {entity['name']} 的微信身份绑定，人物资料保留。"
+
+    def _alias_command(self, room, words, editor):
+        if len(words) == 3 and words[0] in ("添加", "删除"):
+            entity = self.knowledge.change_identity(room, words[1], editor, alias=words[2], remove=words[0] == "删除")
+            return f"已更新 #{entity['id']} {entity['name']} 的别名：{'、'.join(parse_aliases(entity['aliases'])) or '无'}。"
+        if len(words) == 3 and words[1] in ("添加", "删除", "+", "-"):
+            remove = words[1] in ("删除", "-")
+            entity = self.knowledge.change_identity(room, words[0], editor, alias=words[2], remove=remove)
+            return f"已更新 #{entity['id']} {entity['name']} 的别名：{'、'.join(parse_aliases(entity['aliases'])) or '无'}。"
+        if len(words) == 2 and len(words[1]) >= 2 and words[1][0] in ("+", "-"):
+            remove = words[1][0] == "-"
+            entity = self.knowledge.change_identity(room, words[0], editor, alias=words[1][1:], remove=remove)
+            return f"已更新 #{entity['id']} {entity['name']} 的别名：{'、'.join(parse_aliases(entity['aliases'])) or '无'}。"
+        raise MemberError("用法：/别名 <人物名> <+新别名|-旧别名> 或 /管理 别名 添加|删除 人物 别名")
+
+    def _remember_shortcut(self, room, words, editor):
+        from .knowledge import KINDS
+        person, slot = words[0], words[1]
+        if len(words) >= 4 and words[2] in KINDS:
+            kind, content = words[2], " ".join(words[3:])
+        else:
+            kind, content = "人工确认", " ".join(words[2:])
+        entity = self.knowledge.admin_entity(room, person)
+        existing = self.knowledge._db().execute(
+            "SELECT id FROM knowledge_items WHERE entity_id=? AND epoch=? AND slot=?",
+            (entity["id"], entity["epoch"], slot)).fetchone()
+        if existing:
+            self.knowledge.edit(room, existing["id"], editor, content=content)
+            if kind != "人工确认":
+                self.knowledge.classify_memory(room, existing["id"], kind, editor)
+            return f"已更新 #{entity['name']} 的记忆条目 #{existing['id']}（{slot}）。"
+        item_id = self.knowledge.add_memory(room, entity["id"], slot, kind, content, editor)
+        return f"已为 #{entity['id']} {entity['name']} 新增记忆 #{item_id}（{slot}｜{kind}）。"
 
     @staticmethod
     def page(value):
@@ -130,12 +229,21 @@ class MaintenanceService:
 
     def _people(self, room, words, editor):
         k = self.knowledge
-        if words[:1] == ["列表"] and len(words) in (1, 2):
-            page = self.page(words[1]) if len(words) == 2 else 1
-            entities = k._entities(room)
+        if not words or (words[:1] == ["列表"] and len(words) in (1, 2)) or (len(words) == 1 and words[0].isdigit()):
+            if not words:
+                page = 1
+            elif words[0] == "列表":
+                page = self.page(words[1]) if len(words) == 2 else 1
+            else:
+                page = self.page(words[0])
+            entities = [e for e in k._entities(room) if e["entity_key"].startswith("person:")]
+            code_by_wxid = {entry["wxid"]: entry["code"] for entry in self.members.room_member_directory(room)}
             return f"人物共{len(entities)}份，第{page}页：\n" + "\n".join(
-                f"#{e['id']} {e['name']}｜别名：{'、'.join(json.loads(e['aliases'])) or '无'}｜{'已关联成员' if e['wxid'] else '独立人物'}"
+                f"#{e['id']} {e['name']}｜别名：{'、'.join(parse_aliases(e['aliases'])) or '无'}｜"
+                + (f"已绑 {code_by_wxid.get(e['wxid'], '')} 微信:{self.members.wechat_name(e['wxid']) or e['wxid']}" if e["wxid"] else "未绑定")
                 for e in entities[(page-1)*20:page*20])
+        if len(words) == 1:
+            words = ["查看", words[0]]
         if len(words) < 2:
             raise MemberError("用法：/管理 人物 查看|新建|改名|关联|解绑|清空|修订 人物")
         action, value = words[:2]
@@ -147,13 +255,15 @@ class MaintenanceService:
         entity = k.admin_entity(room, value)
         if action == "查看" and len(words) == 2:
             _, count, items = k.admin_items(room, entity["id"])
-            return (f"#{entity['id']} {entity['name']}\n别名：{'、'.join(json.loads(entity['aliases'])) or '无'}\n"
-                    f"关联ID：{entity['wxid'] or '未关联'}\n现行资料{count}条，清空后学习起点 #{entity['learning_floor']}\n" + self.format_items(items))
+            wechat = f"{self.members.wechat_name(entity['wxid']) or '未缓存'} ({entity['wxid']})" if entity["wxid"] else "未绑定"
+            return (f"#{entity['id']} {entity['name']}\n别名：{'、'.join(parse_aliases(entity['aliases'])) or '无'}\n"
+                    f"绑定微信：{wechat}\n现行资料{count}条，清空后学习起点 #{entity['learning_floor']}\n" + self.format_items(items))
         if action == "改名" and len(words) == 3:
             k.change_identity(room, value, editor, name=words[2])
             return "已改名，原名字保留为别名；可另行删除旧别名。"
         if action == "关联" and len(words) == 3:
-            k.link(room, words[2], entity["name"], editor)
+            wxid = self.members.resolve_member_target(room, words[2])
+            k.link(room, wxid, entity["name"], editor)
             return "已关联真实微信成员并保存记录。"
         if action == "解绑" and len(words) == 2:
             k.change_identity(room, value, editor, unlink=True)
@@ -211,21 +321,33 @@ class MaintenanceService:
         raise MemberError("记忆命令参数不正确，请发送 /管理 帮助")
 
     def _members(self, room, words, editor):
-        if words == ["列表"]:
-            db = self.knowledge._db()
-            rows = db.execute("SELECT wxid FROM room_members WHERE account=? AND room=? ORDER BY wxid", (self.members.account, room))
-            return "\n".join(f"{r[0]} {self.members.display_name(r[0], room) or '未绑定'}" for r in rows) or "尚无成员记录。"
+        if not words or words in (["列表"], ["未绑定"], ["已绑定"], ["同步"]):
+            if self.app and self.app._connection_ready:
+                self.app.sync_wechat_directory(room)
+            directory = self.members.room_member_directory(room)
+            if not directory:
+                return "尚无成员记录。"
+            mode = words[0] if words else "列表"
+            bound_count = sum(1 for entry in directory if entry["member"] is not None)
+            if mode == "未绑定":
+                directory = [entry for entry in directory if entry["member"] is None]
+            elif mode == "已绑定":
+                directory = [entry for entry in directory if entry["member"] is not None]
+            lines = [f"群成员共{len(directory)}人（全群已绑定{bound_count}人）："]
+            for entry in directory:
+                if entry["member"] is not None:
+                    status = f"已绑:{entry['member'].name}"
+                elif entry["impersonating"]:
+                    status = "未绑定·撞名保护"
+                else:
+                    status = "未绑定"
+                wx_name = entry["wechat_name"] or "未缓存"
+                lines.append(f"{entry['code']} [{status}] 微信:{wx_name} ({entry['wxid']})")
+            return "\n".join(lines)
         if words[:1] == ["绑定"] and len(words) == 3:
             self.knowledge.require_editor(editor)
-            seen = self.knowledge._db().execute("SELECT 1 FROM room_members WHERE account=? AND room=? AND wxid=?",
-                                               (self.members.account, room, words[1])).fetchone()
-            if not seen:
-                raise MemberError("该微信 ID 尚未在此群留下记录")
-            member = self.members.register(words[2], room, words[1])
-            with self.knowledge._db():
-                self.knowledge.entity_audit(room, 0, editor, "bind-member", {}, {"wxid": member.wxid, "name": member.name})
-            return "已更新该成员的称呼。"
-        raise MemberError("用法：/管理 成员 列表 或 /管理 成员 绑定 微信ID 昵称")
+            return self._bind_shortcut(room, [words[1], words[2]], editor)
+        raise MemberError("用法：/成员 [未绑定|已绑定|同步] 或 /绑定 <@群友|M序号|微信昵称|wxid> <人物名>")
 
     def _runtime(self, room, words):
         app = self.app
@@ -294,7 +416,7 @@ class MaintenanceRouter:
     def submit(self, message):
         text = command_text(message.text)
         root = text.split(maxsplit=1)[0] if text else ""
-        if root not in ("/管理", "/纠正", "/忘记", "/关联人物", "/清空") or message.type != 1:
+        if root not in ADMIN_ROOTS or message.type != 1:
             return False
         if (message.is_self or message.data.get("bot_generated") or not message.data.get("dispatch_to_plugins", True) or
                 message.data.get("self_wxid", self.service.members.account) != self.service.members.account):
@@ -317,8 +439,43 @@ class MaintenanceRouter:
             text = command_text(message.text)
             pieces = text.split(maxsplit=1)
             root, argument = pieces[0], pieces[1] if len(pieces) == 2 else ""
+            at_members = ()
             if root == "/管理":
                 command = argument
+                at_members = message.data.get("at_members", ())
+            elif root in ("/绑定", "/关联人物"):
+                at_members = [wxid for wxid in message.data.get("at_members", ()) if wxid != members.account]
+                cleaned_arg = strip_at_labels(argument).strip() if at_members else argument.strip()
+                if at_members and cleaned_arg.startswith("@") and len(cleaned_arg.split(maxsplit=1)) == 2:
+                    cleaned_arg = cleaned_arg.split(maxsplit=1)[1].strip()
+                if not cleaned_arg:
+                    raise MemberError("用法：/绑定 <@群友|M序号|微信昵称|wxid> <人物名>")
+                command = "绑定 " + cleaned_arg
+            elif root == "/解绑":
+                at_members = [wxid for wxid in message.data.get("at_members", ()) if wxid != members.account]
+                cleaned_arg = strip_at_labels(argument).strip() if at_members else argument.strip()
+                if at_members and cleaned_arg.startswith("@"):
+                    parts = cleaned_arg.split(maxsplit=1)
+                    cleaned_arg = parts[1].strip() if len(parts) == 2 else ""
+                if not cleaned_arg and not at_members:
+                    raise MemberError("用法：/解绑 <@群友|M序号|微信昵称|wxid|人物名>")
+                command = "解绑" + (" " + cleaned_arg if cleaned_arg else "")
+            elif root == "/成员":
+                command = "成员" + (" " + argument.strip() if argument.strip() else " 列表")
+            elif root == "/人物":
+                command = "人物" + (" " + argument.strip() if argument.strip() else " 列表")
+            elif root == "/别名":
+                if not argument.strip():
+                    raise MemberError("用法：/别名 <人物名> <+新别名|-旧别名>")
+                command = "别名 " + argument.strip()
+            elif root == "/改名":
+                if not argument.strip():
+                    raise MemberError("用法：/改名 <旧人物名> <新人物名>")
+                command = "改名 " + argument.strip()
+            elif root == "/记住":
+                if not argument.strip():
+                    raise MemberError("用法：/记住 <人物名> <主题> [类别] <内容>")
+                command = "记住 " + argument.strip()
             elif root in ("/纠正", "/忘记"):
                 values = argument.split(maxsplit=1)
                 if not values:
@@ -326,17 +483,12 @@ class MaintenanceRouter:
                 command = shlex.join(["记忆", "修改" if root == "/纠正" else "停用", *values])
             elif root == "/清空":
                 command = "上下文 清空"
-            else:
-                from .mentions import strip_at_labels
-                targets = [wxid for wxid in message.data.get("at_members", ()) if wxid != members.account]
-                name = strip_at_labels(argument)
-                if len(targets) != 1 or not name:
-                    raise MemberError("用法：/关联人物 @群友 人物名（使用微信真实艾特）")
-                command = shlex.join(["人物", "关联", name, targets[0]])
             if root == "/清空" and message.data.get("context_reset"):
                 result = "已重置本群近期对话上下文，聊天原文和长期知识保留。"
             else:
-                result = self.service.execute(command, message.sender_id, current_room=message.chat_id if message.is_group else None)
+                result = self.service.execute(command, message.sender_id,
+                                              current_room=message.chat_id if message.is_group else None,
+                                              at_members=at_members)
         except MemberError as error:
             result = str(error)
         except (ValueError, KeyError):

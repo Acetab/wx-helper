@@ -32,11 +32,19 @@ class Plugin:
                 raise MemberError("只有管理员可以关联人物")
             targets = [wxid for wxid in message.data.get("at_members", ()) if wxid != self.members.account]
             from wxbot_framework.mentions import strip_at_labels
-            name = strip_at_labels(argument)
-            if len(targets) != 1 or not name:
-                raise MemberError("用法：/关联人物 @群友 人物名（请使用微信真实艾特）")
-            entity = self.knowledge.link(room, targets[0], name, sender)
-            return f"已关联：{self.members.display_name(targets[0], room) or '该成员'} → {entity['name']}。"
+            if targets:
+                name = strip_at_labels(argument).strip()
+                if len(targets) != 1 or not name:
+                    raise MemberError("用法：/绑定 @群友 人物名")
+                target_wxid = targets[0]
+            else:
+                tokens = argument.split(maxsplit=1)
+                if len(tokens) != 2:
+                    raise MemberError("用法：/绑定 <@群友|M序号|微信昵称|wxid> <人物名>")
+                target_wxid = self.members.resolve_member_target(room, tokens[0])
+                name = tokens[1].strip()
+            entity = self.knowledge.link(room, target_wxid, name, sender, create_if_missing=True)
+            return f"已关联：{self.members.wechat_name(target_wxid) or self.members.display_name(target_wxid, room) or '该成员'} → {entity['name']}。"
         if command in ("/纠正", "/忘记"):
             values = argument.split(maxsplit=1)
             if (not values or not values[0].isdigit() or len(values) != (1 if command == "/忘记" else 2)):

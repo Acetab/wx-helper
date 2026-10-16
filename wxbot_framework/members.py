@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -26,6 +28,11 @@ class SnapshotExpired(RuntimeError):
 
 
 BEIJING = timezone(timedelta(hours=8))
+INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\ufeff\u3164\u115f\u1160\uffa0\u2800\u00a0\u2005"
+HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
+    "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+})
 
 
 @dataclass(frozen=True)
@@ -75,9 +82,47 @@ class Member:
 
 
 def name_key(value):
-    if not isinstance(value, str) or not value.strip() or len(value) > 64 or any(c in value for c in "\0\n\r"):
+    if not isinstance(value, str) or len(value) > 64 or any(c in value for c in "\0\n\r"):
         raise MemberError("成员称呼应为 1–64 字符的单行文本")
-    return value.strip().casefold()
+    cleaned = "".join(ch for ch in unicodedata.normalize("NFKC", value).strip() if ch not in INVISIBLE_CHARS).strip()
+    if not cleaned:
+        raise MemberError("成员称呼应为 1–64 字符的单行文本")
+    return cleaned.casefold().translate(HOMOGLYPHS)
+
+
+def parse_json_list(raw):
+    """容错解析数据库中的 JSON 字符串列表（兼容空串、NULL 或手动输入的逗号/顿号分隔文本）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = [part.strip() for part in re.split(r"[,，、;\n]+", text) if part.strip()]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if isinstance(item, (str, int, float)) and str(item).strip()]
+    if isinstance(parsed, str) and parsed.strip():
+        return [parsed.strip()]
+    return []
+
+
+def parse_aliases(raw):
+    """容错解析并归一化人物别名列表，过滤非法值并去重。"""
+    result = []
+    seen = set()
+    for item in parse_json_list(raw):
+        try:
+            key = name_key(item)
+        except MemberError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result
 
 
 class MemberStore:
@@ -301,7 +346,7 @@ class MemberStore:
                 number = speakers.setdefault(item["sender_id"], len(speakers) + 1)
                 # 发给模型的稳定编号替代真实微信 ID；昵称只用于可读性。
                 item["speaker"] = f"P{number}"
-                item["speaker_name"] = item["speaker_name"] or self.wechat_name(item["sender_id"]) or f"未绑定成员{number}"
+                item["speaker_name"] = item["speaker_name"] or self.safe_wechat_name(item["sender_id"], room) or f"未绑定成员{number}"
                 messages.append(item)
             return GroupChatSnapshot(room, day, state[0], tuple(messages))
 
@@ -331,8 +376,8 @@ class MemberStore:
                 raise PersonalityExpired("人格已切换")
             yield
 
-    def conversation_snapshot(self, message):
-        """以当前消息为锚点，读取跨天的本人 10 条与全群 50 条。"""
+    def conversation_snapshot(self, message, *, group_limit=25):
+        """以当前消息为锚点，读取跨天的本人 10 条与全群近期上下文。"""
         if message.chat_id not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
         with self._lock:
@@ -346,12 +391,12 @@ class MemberStore:
                 raise SnapshotExpired("当前消息已被重置")
             previous = self.recent_rows(message.chat_id, limit=10, sender_id=message.sender_id,
                                         before_id=anchor, context=True)
-            group = self.recent_rows(message.chat_id, limit=50, before_id=anchor, context=True)
+            group = self.recent_rows(message.chat_id, limit=group_limit, before_id=anchor, context=True)
             previous_ids = {row["id"] for row in previous}
             group = self.label_speakers([row for row in group if row["id"] not in previous_ids], message.chat_id)
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             return ConversationSnapshot(message.chat_id, day, state[0], member.name if member else
-                                        self.wechat_name(message.sender_id) or "群友",
+                                        self.safe_wechat_name(message.sender_id, message.chat_id) or "群友",
                                         tuple(previous), message.text, tuple(group), anchor)
 
     @contextmanager
@@ -377,10 +422,11 @@ class MemberStore:
         normalized = name_key(name)
         if any(ord(ch) < 32 for ch in name):
             raise MemberError("微信名不能包含控制字符")
+        cleaned = "".join(ch for ch in name.strip() if ch not in INVISIBLE_CHARS).strip()
         with self._lock, self._connection() as db:
             db.execute("""INSERT INTO wechat_names VALUES(?,?,?,?) ON CONFLICT(account,wxid)
                 DO UPDATE SET name=excluded.name,name_key=excluded.name_key""",
-                (self.account, wxid, name.strip(), normalized))
+                (self.account, wxid, cleaned, normalized))
 
     def wechat_name(self, wxid):
         with self._lock:
@@ -388,10 +434,136 @@ class MemberStore:
                                              (self.account, wxid)).fetchone()
             return row[0] if row else None
 
+    def is_impersonating_name(self, wxid, room, candidate_name):
+        """防冒充校验：未绑定该身份的成员，若微信昵称与管理员、已登记成员或知识库人物主名/别名撞名（含同形字），视为撞名。"""
+        try:
+            key = name_key(candidate_name)
+        except MemberError:
+            return True
+        with self._lock:
+            db = self._connection()
+            if self.owner_wxid and wxid != self.owner_wxid:
+                owner_name = db.execute("SELECT name_key FROM wechat_names WHERE account=? AND wxid=?",
+                                        (self.account, self.owner_wxid)).fetchone()
+                if owner_name and owner_name[0] == key:
+                    return True
+            if room is not None:
+                clash_member = db.execute("""SELECT p.wxid FROM people p JOIN aliases a USING(account,room,person_key)
+                    WHERE a.account=? AND a.room=? AND a.alias=?""", (self.account, room, key)).fetchone()
+                if clash_member and clash_member["wxid"] != wxid:
+                    return True
+                has_kb = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_entities'").fetchone()
+                if has_kb:
+                    for row in db.execute("""SELECT name, aliases, wxid FROM knowledge_entities
+                        WHERE account=? AND room=? AND entity_key LIKE 'person:%'""", (self.account, room)):
+                        if row["wxid"] == wxid:
+                            continue
+                        aliases = {name_key(row["name"]), *parse_aliases(row["aliases"])}
+                        if key in aliases:
+                            return True
+            return False
+
+    def safe_wechat_name(self, wxid, room=None):
+        """返回通过防冒充校验的微信昵称；若撞名则返回 None（仅记录在 wechat_names，不作为显示身份）。"""
+        raw = self.wechat_name(wxid)
+        if not raw:
+            return None
+        if room is not None and self.is_impersonating_name(wxid, room, raw):
+            return None
+        return raw
+
     def display_name(self, wxid, room):
-        """群内绑定优先；其他群的绑定永远不作为默认名字。"""
+        """群内绑定优先；未绑定时使用通过防冒充校验的微信昵称。"""
         member = self.find_by_wxid(wxid, room)
-        return member.display_name if member else self.wechat_name(wxid)
+        return member.display_name if member else self.safe_wechat_name(wxid, room)
+
+    def at_display_name(self, wxid, room):
+        """群内 @ 气泡前缀优先使用真实微信昵称，无缓存时回退到群内绑定名。"""
+        return self.wechat_name(wxid) or self.display_name(wxid, room)
+
+    def sync_room_directory(self, room, member_wxids=(), wechat_names=None):
+        if room not in self.groups:
+            return
+        now = self._now().astimezone(timezone.utc).isoformat()
+        with self._lock, self._connection() as db:
+            for wxid in member_wxids:
+                validate_mentions(room, [wxid])
+                db.execute("""INSERT INTO room_members(account,room,wxid,first_seen,last_seen) VALUES(?,?,?,?,?)
+                    ON CONFLICT(account,room,wxid) DO UPDATE SET first_seen=COALESCE(room_members.first_seen,excluded.first_seen)""",
+                    (self.account, room, wxid, now, now))
+            for wxid, name in (wechat_names or {}).items():
+                validate_mentions(room, [wxid])
+                db.execute("""INSERT INTO room_members(account,room,wxid,first_seen,last_seen) VALUES(?,?,?,?,?)
+                    ON CONFLICT(account,room,wxid) DO UPDATE SET first_seen=COALESCE(room_members.first_seen,excluded.first_seen)""",
+                    (self.account, room, wxid, now, now))
+                if name:
+                    try:
+                        self.remember_wechat_name(wxid, name)
+                    except MemberError:
+                        pass
+
+    def room_member_directory(self, room):
+        if room not in self.groups:
+            raise MemberError("这个群尚未启用成员目录")
+        with self._lock:
+            db = self._connection()
+            rows = db.execute("SELECT wxid FROM room_members WHERE account=? AND room=? ORDER BY wxid",
+                              (self.account, room)).fetchall()
+            directory = []
+            for index, row in enumerate(rows, 1):
+                wxid = row["wxid"]
+                raw_name = self.wechat_name(wxid)
+                member = self.find_by_wxid(wxid, room)
+                impersonating = bool(raw_name and not member and self.is_impersonating_name(wxid, room, raw_name))
+                directory.append({
+                    "index": index,
+                    "code": f"M{index}",
+                    "wxid": wxid,
+                    "wechat_name": raw_name,
+                    "member": member,
+                    "impersonating": impersonating,
+                })
+            return directory
+
+    def resolve_member_target(self, room, token="", *, at_members=()):
+        if room not in self.groups:
+            raise MemberError("这个群尚未启用成员目录")
+        with self._lock:
+            targets = [wxid for wxid in at_members if wxid != self.account]
+            if len(targets) > 1:
+                raise MemberError("一次只能指定一位群成员")
+            if len(targets) == 1:
+                validate_mentions(room, [targets[0]])
+                return targets[0]
+            clean = (token or "").strip()
+            if clean.startswith("@"):
+                clean = clean[1:].strip()
+            if not clean:
+                raise MemberError("请指定群成员（可 @群友、填 M序号、当前微信昵称或 wxid）")
+            directory = self.room_member_directory(room)
+            if len(clean) >= 2 and clean[0] in ("M", "m") and clean[1:].isdigit():
+                code = clean.upper()
+                for entry in directory:
+                    if entry["code"] == code:
+                        return entry["wxid"]
+                raise MemberError(f"未找到成员编号 {code}，请先发送 /成员 查看列表")
+            for entry in directory:
+                if entry["wxid"] == clean:
+                    return entry["wxid"]
+            if clean.startswith("wxid_"):
+                validate_mentions(room, [clean])
+                return clean
+            key = name_key(clean)
+            by_wechat = [entry for entry in directory if entry["wechat_name"] and name_key(entry["wechat_name"]) == key]
+            if len(by_wechat) == 1:
+                return by_wechat[0]["wxid"]
+            if len(by_wechat) > 1:
+                choices = "、".join(f"{e['code']}({e['wxid']})" for e in by_wechat)
+                raise MemberError(f"微信昵称“{clean}”对应多位群成员：{choices}，请改用 M序号 指定")
+            member = self.resolve(clean, room)
+            if member and member.wxid:
+                return member.wxid
+            raise MemberError(f"未找到群成员“{clean}”，可使用 @群友、/成员 中的 M序号、微信昵称或 wxid")
 
     def _row(self, name, room=None):
         sql = """SELECT p.* FROM people p JOIN aliases a USING(account,room,person_key)
@@ -418,6 +590,8 @@ class MemberStore:
                 (self.account, names[0]["room"], names[0]["wxid"])).fetchone()
             if bound:
                 return bound
+            if self.is_impersonating_name(names[0]["wxid"], names[0]["room"], names[0]["name"]):
+                raise MemberError(f"称呼 {name} 与群内人物或管理员重名且尚未绑定，请先由管理员绑定")
             return {"room": names[0]["room"], "name": names[0]["name"], "wxid": names[0]["wxid"],
                     "person_key": None, "display_name": names[0]["name"], "self_named": 0}
         if len(rows) != 1:
@@ -499,7 +673,13 @@ class MemberStore:
             raise MemberError("群记录缺少正文或连接标识")
         native_name = message.data.get("sender_wechat_name")
         if native_name:
-            self.remember_wechat_name(message.sender_id, native_name)
+            try:
+                self.remember_wechat_name(message.sender_id, native_name)
+            except MemberError:
+                pass
+        at_names = message.data.get("at_member_names")
+        if isinstance(at_names, dict) and at_names:
+            self.sync_room_directory(message.chat_id, tuple(at_names.keys()), at_names)
         with self._lock, self._connection() as db:
             self.rollover()
             db.execute("INSERT OR IGNORE INTO room_members(account,room,wxid) VALUES(?,?,?)",

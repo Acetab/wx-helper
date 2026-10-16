@@ -109,11 +109,29 @@ class FixedPersonalityTests(unittest.TestCase):
 
     def test_unbound_member_gets_real_id_and_binding_reminder_once(self):
         plugin = self.setup_chat()
-        plugin.on_message(self.chat(sender="wxid_unbound"), self.ctx)
+        plugin.on_message(self.chat(sender="wxid_unbound", sender_wechat_name="路人甲"), self.ctx)
         self.assertEqual(self.backend.sent[-1][2], ("wxid_unbound",))
-        self.assertIn("/绑定", self.backend.sent[-1][1])
-        plugin.on_message(self.chat(sender="wxid_unbound", sequence=101), self.ctx)
+        self.assertTrue(self.backend.sent[-1][1].startswith("@路人甲\u2005"))
         self.assertNotIn("/绑定", self.backend.sent[-1][1])
+
+    def test_bound_person_uses_wechat_name_for_at_and_person_name_for_llm_context(self):
+        provider = Mock(return_value={"reply": "你是示例人物乙（乙哥），长语音担当。"})
+        plugin = self.setup_chat(provider)
+        kb = self.ctx.knowledge
+        person = kb.entity(ROOM, "示例人物乙", aliases=["乙哥", "小乙"], pinned=True)
+        kb.add_memory(ROOM, person["id"], "长语音担当", "群内玩笑", "乙哥的经典形象是超长语音。", CAT)
+        self.store.record(self.message("测试发言", sender=OTHER, sequence=1,
+                                       data={"sender_wechat_name": "示例微信昵称", "self_wxid": ROBOT}))
+        kb.link(ROOM, OTHER, "示例人物乙", CAT)
+        plugin.on_message(self.chat("我是谁", sender=OTHER, sequence=2, sender_wechat_name="示例微信昵称"), self.ctx)
+        payload = json.loads(provider.call_args.args[1])
+        self.assertEqual(payload["name"], "示例人物乙")
+        self.assertTrue(payload["speaker_profile"]["bound"])
+        self.assertEqual(payload["speaker_profile"]["name"], "示例人物乙")
+        self.assertIn("乙哥", payload["speaker_profile"]["aliases"])
+        self.assertEqual(payload["speaker_profile"]["wechat_name"], "示例微信昵称")
+        self.assertEqual(payload["knowledge"][0]["name"], "示例人物乙")
+        self.assertTrue(self.backend.sent[-1][1].startswith("@示例微信昵称\u2005\n"))
 
     def test_long_reply_respects_byte_limit_and_is_not_twenty_characters(self):
         plugin = self.setup_chat(Mock(return_value={"reply": "中文🌸" * 190}))

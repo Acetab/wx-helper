@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .database import backup_database
 from .knowledge import KINDS, sanitized
-from .members import MemberError, name_key
+from .members import MemberError, name_key, parse_aliases
 
 logger = logging.getLogger("Upgrade")
 
@@ -72,7 +72,7 @@ def apply_upgrade(knowledge, path):
                     entity = knowledge.find_person(room, person)
                 except MemberError:
                     continue  # 全新数据库没有待清理的旧别名。
-                retained = set(json.loads(entity["aliases"])) - {name_key(a) for a in aliases}
+                retained = set(parse_aliases(entity["aliases"])) - {name_key(a) for a in aliases}
                 db.execute("UPDATE knowledge_entities SET aliases=?,aliases_manual=1 WHERE id=?",
                            (json.dumps(sorted(retained), ensure_ascii=False), entity["id"]))
                 for alias in aliases:

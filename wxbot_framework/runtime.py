@@ -71,6 +71,7 @@ class BotApplication:
             self._last_connection_error = ""
             logger.info("微信已连接，PID=%s；收发范围：%s", candidate.pid,
                         getattr(candidate, "scope", "文本"))
+            self.sync_wechat_directory()
         except Exception as error:
             self._connection_ready = False
             self._log_connection_error(error)
@@ -78,6 +79,25 @@ class BotApplication:
         if self._connection_ready and self.startup_notice:
             # 公告失败不影响微信连接；已持久化的发送标记避免重连重复。
             self.startup_notice.send()
+
+    def sync_wechat_directory(self, room=None):
+        if not self._connection_ready or self.backend is None or self.members is None:
+            return {"members": 0, "names": 0}
+        reader = getattr(self.backend, "read_room_directory", None)
+        if not callable(reader):
+            return {"members": 0, "names": 0}
+        rooms = [room] if room else sorted(self.members.groups)
+        total_members, total_names = 0, 0
+        for target_room in rooms:
+            try:
+                members, names = reader(target_room)
+                if members or names:
+                    self.members.sync_room_directory(target_room, members, names)
+                    total_members += len(members)
+                    total_names += len(names)
+            except Exception:
+                logger.warning("同步群成员缓存暂缓：room=%s", target_room)
+        return {"members": total_members, "names": total_names}
 
     def _emit(self, message):
         allowed = self.config.get("chat_allowlist", [])

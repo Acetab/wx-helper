@@ -97,11 +97,11 @@ class HourlyScheduler:
         try:
             current = lambda: (not self.stop_event.is_set() and self.service.session_id == session and
                                self.members.snapshot_is_current(snapshot))
-            rows = snapshot.messages
+            rows = snapshot.messages[-60:]
             query = "\n".join(row["text"] for row in rows)
             memories = [{"name": item["name"], "kind": item["kind"], "content": item["content"]}
-                        for item in self.knowledge.search(room, query)]
-            recent = [{"time": row["received_at"], "name": row["speaker_name"], "speaker": row["speaker"],
+                        for item in self.knowledge.search(room, query, limit=6, char_limit=2400)]
+            recent = [{"time": row["received_at"][:16], "name": row["speaker_name"], "speaker": row["speaker"],
                        "text": row["text"]} for row in rows]
             payload = {"recent": recent, "knowledge": memories, "recent_topics": topics}
             if len(json.dumps(payload, ensure_ascii=False)) > 16000:

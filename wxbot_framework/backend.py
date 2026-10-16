@@ -75,3 +75,6 @@ class NativeTextBackend(NativeFileHelperBackend):
 
     def send_at_text(self, room_wxid, content, at_list):
         return self.raw.send_at_text(room_wxid, content, at_list)
+
+    def read_room_directory(self, room_wxid):
+        return self.raw.read_room_directory(room_wxid)
