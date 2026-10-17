@@ -1,5 +1,5 @@
 {
   "api": "v1",
-  "description": "群内成语接龙：全群共享一条接龙进度，四字成语接首字；大模型判定与出题",
+  "description": "全群成语接龙闯关：常用词池出题并留足接法，提供进度、提示、换题与结算；模型复核表外答案",
   "requires": ["group.text.receive", "group.text.send", "group.text.mention"]
 }

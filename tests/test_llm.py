@@ -99,63 +99,60 @@ class JudgeTests(unittest.TestCase):
             self.assertFalse(self.judge.evaluate(previous, word, used).accepted)
         self.assertEqual(self.client.calls, [])
 
-    def test_success_sends_only_game_words(self):
+    def test_common_answer_does_not_call_model(self):
         result = self.judge.evaluate("一心一意", "意气风发", ("一心一意",))
         self.assertTrue(result.accepted)
-        self.assertEqual(result.next_idiom, "发扬光大")
-        self.assertEqual(json.loads(self.client.calls[0][1]),
-                         {"previous": "一心一意", "candidate": "意气风发", "used": ["一心一意", "意气风发"]})
+        self.assertEqual(result.next_idiom[0], "发")
+        self.assertEqual(self.client.calls, [])
+        self.assertGreaterEqual(len(self.judge.lexicon.continuations(result.next_idiom,
+                                ("一心一意", "意气风发", result.next_idiom))), 3)
 
     def test_model_can_reject_fake_four_character_word(self):
         self.client.result = {"is_idiom": False, "reason": "不是成语", "next_idiom": ""}
         result = self.judge.evaluate("一心一意", "意意意意", ("一心一意",))
         self.assertFalse(result.accepted)
 
-    def test_invalid_model_next_word_keeps_the_accepted_player_answer(self):
-        for word in ("假的", "一心一意", "发扬光大", "意气风发"):
+    def test_model_cannot_choose_a_dead_end_or_skip_turn(self):
+        for word in ("假的", "一心一意", "发扬光大", "", "意气风发"):
             self.client.result["next_idiom"] = word
             self.client.calls.clear()
             with self.subTest(word=word):
-                result = self.judge.evaluate("一心一意", "意气风发", ("一心一意", "发扬光大"))
+                result = self.judge.evaluate("一心一意", "意气风发", ("一心一意",))
                 self.assertTrue(result.accepted)
-                self.assertEqual(result.next_idiom, "")
-                self.assertEqual(len(self.client.calls), 2)
+                self.assertTrue(result.next_idiom)
+                self.assertEqual(len(self.client.calls), 0)
 
-    def test_invalid_next_word_is_corrected_without_rejudging_player(self):
-        self.client.complete_json = Mock(side_effect=[
-            {"is_idiom": True, "reason": "常见成语", "next_idiom": "可歌可泣"},
-            {"next_idiom": "声东击西"}])
+    def test_unknown_answer_sends_only_candidate_to_model(self):
         used = ("万事如意", "意有所指", "指日可待", "待人接物", "物是人非", "非同小可", "可歌可泣")
         result = self.judge.evaluate("可歌可泣", "泣不成声", used)
         self.assertTrue(result.accepted)
-        self.assertEqual(result.next_idiom, "声东击西")
-        correction = json.loads(self.client.complete_json.call_args.args[1])
-        self.assertEqual(correction["required_first"], "声")
-        self.assertEqual(correction["used"], [*used, "泣不成声"])
-        self.assertEqual(correction["rejected_next"], "可歌可泣")
+        self.assertTrue(result.next_idiom.startswith("声"))
+        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(json.loads(self.client.calls[0][1]), {"candidate": "泣不成声"})
 
-    def test_next_word_request_failure_does_not_undo_an_accepted_answer(self):
-        self.client.complete_json = Mock(side_effect=[
-            {"is_idiom": True, "reason": "常见成语", "next_idiom": "假的"}, LLMError("测试超时")])
+    def test_common_answer_works_during_model_outage(self):
+        self.client.complete_json = Mock(side_effect=LLMError("测试超时"))
         result = self.judge.evaluate("一心一意", "意气风发", ("一心一意",))
         self.assertTrue(result.accepted)
-        self.assertEqual(result.next_idiom, "")
+        self.assertTrue(result.next_idiom)
+        self.client.complete_json.assert_not_called()
 
-    def test_malformed_next_word_correction_does_not_undo_an_accepted_answer(self):
-        self.client.complete_json = Mock(side_effect=[
-            {"is_idiom": True, "reason": "常见成语", "next_idiom": "假的"}, None])
-        result = self.judge.evaluate("一心一意", "意气风发", ("一心一意",))
-        self.assertTrue(result.accepted)
-        self.assertEqual(result.next_idiom, "")
+    def test_unknown_answer_model_errors_are_not_a_game_loss(self):
+        self.client.complete_json = Mock(side_effect=LLMError("测试超时"))
+        with self.assertRaises(LLMError):
+            self.judge.evaluate("可歌可泣", "泣不成声", ())
+        for malformed in (None, [], {}, {"is_idiom": True, "reason": None}):
+            self.client.complete_json = Mock(return_value=malformed)
+            with self.subTest(malformed=malformed), self.assertRaises(LLMError):
+                self.judge.evaluate("可歌可泣", "泣不成声", ())
 
     def test_model_boolean_is_strict(self):
         self.client.result["is_idiom"] = "true"
         with self.assertRaises(LLMError):
-            self.judge.evaluate("一心一意", "意气风发", ())
+            self.judge.evaluate("可歌可泣", "泣不成声", ())
 
     def test_opening_shape(self):
-        self.client.result = {"idiom": "一心一意"}
-        self.assertEqual(self.judge.opening(), "一心一意")
-        self.client.result = {"idiom": "假词"}
-        with self.assertRaises(LLMError):
-            self.judge.opening()
+        opening = self.judge.opening()
+        self.assertIn(opening, self.judge.lexicon.words)
+        self.assertGreaterEqual(len(self.judge.lexicon.continuations(opening, (opening,))), 3)
+        self.assertEqual(self.client.calls, [])

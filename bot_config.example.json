@@ -54,7 +54,8 @@
     "idiom_chain": {
       "enabled": false,
       "member_names": {},
-      "idle_seconds": 1800
+      "idle_seconds": 1800,
+      "target_rounds": 10
     },
     "id_responder": {
       "enabled": true

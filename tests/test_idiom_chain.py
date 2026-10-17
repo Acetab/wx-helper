@@ -69,6 +69,15 @@ class Context:
 
 class IdiomPluginTests(unittest.TestCase):
     def setUp(self):
+        def choose(words):
+            return next((word for word in ("一心一意", "发扬光大", "心口如一") if word in words), words[0])
+        chooser = patch("plugins.idiom_chain.lexicon.random.Random.choice", side_effect=choose)
+        chooser.start()
+        self.addCleanup(chooser.stop)
+        strategy = patch("plugins.idiom_chain.lexicon.Lexicon._choose_sustainable",
+                         side_effect=lambda words, used, minimum: choose(words))
+        strategy.start()
+        self.addCleanup(strategy.stop)
         self.ctx = Context()
         self.plugin = Plugin()
         self.plugin.on_load(self.ctx)
@@ -104,12 +113,12 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.ctx.sent[-1][2:], (A, "小明"))
         self.assertIn("发扬光大", self.ctx.sent[-1][1])
         # 第二位玩家接着上一位玩家报出的“大”继续，而不是回到开场成语。
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
         self.assertEqual(self.ctx.sent[-1][2:], (B, "小红"))
-        self.assertIn("大大方方", self.ctx.sent[-1][1])
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
-        self.assertEqual(self.plugin.games[ROOM].chain.used[-2:], ("大大方方", "方兴未艾"))
+        self.assertIn("大快人心", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
+        self.assertEqual(self.plugin.games[ROOM].chain.used[-2:], ("大快人心", "心口如一"))
 
     def test_plain_chat_is_ignored_while_game_runs(self):
         self.start()
@@ -141,21 +150,21 @@ class IdiomPluginTests(unittest.TestCase):
         arrived = time.monotonic()
         self.send("意气风发", A, received_at=arrived)
         count = len(self.ctx.sent)
-        self.send("大大方方", B, received_at=arrived + 0.00000001)
+        self.send("大快人心", B, received_at=arrived + 0.00000001)
         self.assertEqual(len(self.ctx.sent), count)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
 
     def test_merged_command_keeps_the_same_shared_chain(self):
         self.start()
         self.send("意气风发", A)
         self.send("合并接龙")
         self.assertIn("发扬光大", self.ctx.sent[-1][1])
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
 
     def test_status_command_reports_current_word_without_starting_over(self):
         self.start()
@@ -230,10 +239,10 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(state.data[(ROOM, FEATURE)]["current"], "发扬光大")
         # 重启后换一个插件实例，靠共享状态接着上一局继续。
         self.use_state(state)
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
         self.assertIn("发扬光大", self.ctx.sent[-1][1])
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
 
     def test_restored_progress_keeps_remaining_idle_time(self):
         state = FakeRoomState()
@@ -305,21 +314,18 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
         self.assertIn("重试", self.ctx.sent[-1][1])
 
-    def test_failed_bot_continuation_commits_player_answer_for_the_next_player(self):
+    def test_model_cannot_skip_bot_turn(self):
         state = FakeRoomState()
         self.use_state(state)
         self.start()
         self.ctx.llm.result["next_idiom"] = "假的"
         self.send("意气风发", A)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "意气风发")
-        self.assertEqual(self.plugin.games[ROOM].chain.used, ("一心一意", "意气风发"))
-        self.assertEqual(state.data[(ROOM, FEATURE)]["current"], "意气风发")
-        self.assertIn("发", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+        self.assertEqual(self.plugin.games[ROOM].chain.used, ("一心一意", "意气风发", "发扬光大"))
+        self.assertEqual(state.data[(ROOM, FEATURE)]["current"], "发扬光大")
+        self.assertIn("1/10", self.ctx.sent[-1][1])
         self.assertNotIn("暂时无法判定", self.ctx.sent[-1][1])
         self.assertNotIn("我接：意气风发", self.ctx.sent[-1][1])
-        self.ctx.llm.result["next_idiom"] = "大有可为"
-        self.send("发扬光大", B)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "大有可为")
 
     def test_failed_send_keeps_original_question_even_when_bot_cannot_continue(self):
         self.start()
@@ -329,10 +335,10 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
         self.assertEqual(self.plugin.games[ROOM].chain.used, ("一心一意",))
 
-    def test_model_opening_failure_does_not_create_game(self):
-        with patch("plugins.idiom_chain.IdiomJudge.opening", side_effect=LLMError("测试超时")), self.assertLogs("IdiomTests"):
+    def test_opening_does_not_need_model(self):
+        with patch.object(self.ctx.llm, "complete_json", side_effect=LLMError("测试超时")):
             self.send("成语接龙")
-        self.assertEqual(self.plugin.games, {})
+        self.assertIn(ROOM, self.plugin.games)
 
     def test_idle_game_expires_and_is_not_treated_as_chain(self):
         self.start()
@@ -355,6 +361,168 @@ class IdiomPluginTests(unittest.TestCase):
     def test_invalid_idle_configuration(self):
         for value in (True, 0, 59, 86401, "1800"):
             self.ctx.config = {"member_names": {}, "idle_seconds": value}
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Plugin().on_load(self.ctx)
+
+    def test_progress_and_scores_survive_restart_without_refilling_help(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.start()
+        self.send("意气风发", A)
+        self.send("接龙提示")
+        saved_hint = self.plugin.games[ROOM].hint_word
+        self.use_state(state)
+        self.send("接龙状态")
+        game = self.plugin.games[ROOM]
+        self.assertEqual((game.rounds, game.scores, game.hints_left, game.hint_word), (1, {A: 1}, 1, saved_hint))
+        self.send("大快人心", B)
+        self.assertEqual(self.plugin.games[ROOM].scores, {A: 1, B: 1})
+        self.assertIn("2/10", self.ctx.sent[-1][1])
+        self.assertIn("2 人参与", self.ctx.sent[-1][1])
+
+    def test_explicit_answer_explains_bad_prefix_and_bad_length(self):
+        self.start()
+        for text in ("/接龙 异想天开", "/接龙 意气风发啊", "/接龙", "/接龙 意气风发！"):
+            with self.subTest(text=text):
+                self.send(text)
+                self.assertIn("不扣进度", self.ctx.sent[-1][1])
+                self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.send("/接龙\t意气风发", is_self=True)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 1)
+
+    def test_help_and_explicit_answer_require_a_game(self):
+        for text in ("接龙提示", "接龙换题", "接龙状态", "/接龙 意气风发"):
+            self.send(text)
+            self.assertIn("请先", self.ctx.sent[-1][1])
+
+    def test_hint_has_real_unused_answer_and_cannot_be_refilled(self):
+        self.start()
+        self.send("接龙提示")
+        game = self.plugin.games[ROOM]
+        self.assertIn(game.hint_word, self.plugin.judge.lexicon.continuations(game.chain.current, game.chain.used))
+        self.assertNotIn(game.hint_word, self.ctx.sent[-1][1])
+        self.assertIn(game.hint_word[0] + "□□" + game.hint_word[-1], self.ctx.sent[-1][1])
+        self.send("接龙提示")
+        self.assertIn(game.hint_word[:2] + "□" + game.hint_word[-1], self.ctx.sent[-1][1])
+        self.send("接龙提示")
+        self.assertIn("已经用完", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].hints_left, 0)
+
+    def test_failed_hint_or_swap_send_does_not_consume_budget(self):
+        self.start()
+        game = self.plugin.games[ROOM]
+        self.ctx.succeeds = False
+        for text in ("接龙提示", "接龙换题"):
+            self.send(text)
+            self.assertEqual(self.plugin.games[ROOM], game)
+        self.ctx.succeeds = True
+        self.send("接龙换题")
+        self.assertNotEqual(self.plugin.games[ROOM].chain.current, game.chain.current)
+        self.assertEqual(self.plugin.games[ROOM].swaps_left, 0)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.send("接龙换题")
+        self.assertIn("已经用完", self.ctx.sent[-1][1])
+
+    def test_swap_preserves_player_move_scores_and_history(self):
+        self.start()
+        self.send("意气风发")
+        self.send("大快人心", B)
+        game = self.plugin.games[ROOM]
+        self.send("接龙换题")
+        new = self.plugin.games[ROOM]
+        self.assertEqual(new.rounds, 2)
+        self.assertEqual(new.scores, {A: 1, B: 1})
+        self.assertEqual(new.chain.current[0], "心")
+        self.assertNotEqual(new.chain.current, game.chain.current)
+        self.assertEqual(new.chain.used[:-1], game.chain.used)
+        self.assertGreaterEqual(len(self.plugin.judge.lexicon.continuations(new.chain.current, new.chain.used)), 3)
+
+    def test_no_alternative_does_not_spend_swap(self):
+        self.start()
+        self.send("意气风发")
+        self.send("接龙换题")
+        self.assertIn("不扣", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].swaps_left, 1)
+
+    def test_stale_help_message_does_not_spend_budget(self):
+        self.start()
+        game = self.plugin.games[ROOM]
+        count = len(self.ctx.sent)
+        self.send("接龙提示", received_at=game.chain.ready_at - 1)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].hints_left, 2)
+
+    def test_clear_victory_at_target_and_fresh_game_afterwards(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.plugin.goal = 3
+        self.start()
+        self.send("意气风发", A)
+        self.send("大快人心", B)
+        self.assertIn("最后一棒", self.ctx.sent[-1][1])
+        self.send("一鸣惊人", A)
+        self.assertIn("全群通关", self.ctx.sent[-1][1])
+        self.assertIn("3/3", self.ctx.sent[-1][1])
+        self.assertIn("你贡献了 2 次", self.ctx.sent[-1][1])
+        self.assertNotIn(ROOM, self.plugin.games)
+        self.assertNotIn((ROOM, FEATURE), state.data)
+        self.start()
+        self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.assertEqual(self.plugin.games[ROOM].hints_left, 2)
+
+    def test_bot_has_no_fair_move_concedes_instead_of_skipping(self):
+        self.start()
+        self.send("意气相投")
+        self.send("好高骛远")  # 投其所好后，“远”无可出题项。
+        self.assertIn("绝杀", self.ctx.sent[-1][1])
+        self.assertIn("常用词池", self.ctx.sent[-1][1])
+        self.assertNotIn("大家继续接", self.ctx.sent[-1][1])
+        self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_failed_victory_send_keeps_question_and_score(self):
+        self.start()
+        with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
+            self.ctx.succeeds = False
+            self.send("意气风发")
+            self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+            self.ctx.succeeds = True
+            self.send("意气风发")
+        self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_surrender_reveals_real_answers_and_failed_exit_keeps_game(self):
+        self.start()
+        self.ctx.succeeds = False
+        self.send("接龙认输")
+        self.assertIn(ROOM, self.plugin.games)
+        self.ctx.succeeds = True
+        self.send("接龙认输")
+        self.assertIn("刚才可以接", self.ctx.sent[-1][1])
+        self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_unknown_word_model_outage_does_not_change_progress(self):
+        self.start()
+        before = self.plugin.games[ROOM]
+        with patch.object(self.ctx.llm, "complete_json", side_effect=LLMError("超时")), self.assertLogs("IdiomTests"):
+            self.send("意料之外")
+        self.assertEqual(self.plugin.games[ROOM].rounds, before.rounds)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, before.chain.current)
+        self.assertEqual(self.plugin.games[ROOM].scores, {})
+
+    def test_invalid_saved_counters_are_not_restored(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.start()
+        good = state.data[(ROOM, FEATURE)].copy()
+        for changes in ({"rounds": True}, {"goal": 0}, {"hints_left": -1}, {"swaps_left": 2},
+                        {"scores": {A: True}}, {"rounds": 1}, {"scores": []}):
+            state.data[(ROOM, FEATURE)] = {**good, **changes}
+            self.use_state(state)
+            self.send("接龙状态")
+            self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_invalid_goal_configuration(self):
+        for value in (True, 0, 2, 31, "10"):
+            self.ctx.config = {"target_rounds": value}
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Plugin().on_load(self.ctx)
 

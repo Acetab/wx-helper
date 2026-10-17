@@ -60,7 +60,11 @@ class Plugin:
     def game_context(state):
         current = state["current"]
         used = [word for word in state.get("used", []) if isinstance(word, str)][-USED_SAMPLE:]
-        return {"current": current, "next_char": current[-1], "used": used}
+        context = {"current": current, "next_char": current[-1], "used": used}
+        for key in ("rounds", "goal", "hints_left", "swaps_left"):
+            if type(state.get(key)) is int:
+                context[key] = state[key]
+        return context
 
     def on_message(self, message, ctx):
         if (message.type != 1 or not message.is_group or message.chat_id not in self.members.groups or
