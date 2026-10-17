@@ -1,0 +1,5 @@
+{
+  "api": "v1",
+  "description": "真实群聊语录竞猜、手动群报和有出处的群梗词典",
+  "requires": ["group.text.receive", "group.text.send"]
+}

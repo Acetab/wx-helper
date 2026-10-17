@@ -56,6 +56,10 @@
       "member_names": {},
       "idle_seconds": 1800
     },
+    "group_fun": {
+      "enabled": false,
+      "report_limit": 500
+    },
     "id_responder": {
       "enabled": true
     },

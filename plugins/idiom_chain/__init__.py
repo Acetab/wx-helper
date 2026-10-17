@@ -15,7 +15,7 @@ from wxbot_framework.mentions import strip_at_labels
 from wxbot_framework.personality import game_reply
 from wxbot_framework.text import FOUR_CHINESE, GROUP_CONTROL_COMMANDS, validate_mentions
 from .judge import IdiomJudge
-from wxbot_framework.commands import command_text, HELP_TEXT
+from wxbot_framework.commands import command_text, HELP_TEXT, is_control
 
 HELP = HELP_TEXT
 DEFAULT_IDLE_SECONDS = 1800
@@ -148,7 +148,7 @@ class Plugin:
         text = command_text(message.text)
         judge = IdiomJudge(ctx.llm_for(message, personality=personality))
         guard = lambda: ctx.personality_guard(personality)
-        if text == "/help":
+        if is_control(text) and text not in {"成语接龙", "合并接龙", "退出接龙"}:
             return
         room = message.chat_id
         self._expire(ctx, room)

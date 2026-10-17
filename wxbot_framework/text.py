@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import re
-from .commands import COMMANDS, command_text
+from .commands import COMMANDS, GAME_COMMANDS, command_text
 
 WXID = re.compile(r"^[A-Za-z0-9_.@-]{1,127}$")
 SYSTEM_PEERS = frozenset({"weixin", "fmessage", "newsapp", "floatbottle"})
-GROUP_CONTROL_COMMANDS = frozenset({"/help", "成语接龙", "合并接龙", "退出接龙"})
+GROUP_CONTROL_COMMANDS = GAME_COMMANDS | {"/help"}
 FOUR_CHINESE = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff]{4}$")
 
 
