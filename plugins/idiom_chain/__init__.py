@@ -23,6 +23,7 @@ FEATURE = "idiom_chain"
 USED_LIMIT = 200
 MIN_FOLLOWUPS = 3
 DEFAULT_GOAL = 10
+DEFAULT_RESCUES = 3
 
 
 def answer_text(text):
@@ -47,6 +48,7 @@ class Game:
     scores: dict = field(default_factory=dict)
     hints_left: int = 2
     swaps_left: int = 1
+    rescues_left: int = DEFAULT_RESCUES
     last_player: str = ""
     hint_word: str = ""
 
@@ -75,6 +77,10 @@ class Plugin:
         if type(goal) is not int or not 3 <= goal <= 30:
             raise ValueError("idiom_chain.target_rounds 应为 3–30 的整数")
         self.goal = goal
+        rescues = ctx.config.get("bot_rescues", DEFAULT_RESCUES)
+        if type(rescues) is not int or not 0 <= rescues <= 10:
+            raise ValueError("idiom_chain.bot_rescues 应为 0–10 的整数")
+        self.rescues = rescues
 
     def on_unload(self, ctx):
         self.games.clear()
@@ -153,6 +159,9 @@ class Plugin:
                 return None
             game.rounds, game.goal, game.scores = rounds, goal, dict(scores)
             game.hints_left, game.swaps_left = hints, swaps
+            saved_rescues = state.get("rescues_left", self.rescues)
+            game.rescues_left = (saved_rescues if type(saved_rescues) is int and 0 <= saved_rescues <= 10
+                                 else self.rescues)
             last_player, hint_word = state.get("last_player", ""), state.get("hint_word", "")
             if isinstance(last_player, str) and last_player in words and last_player[-1] == current[0]:
                 game.last_player = last_player
@@ -175,6 +184,7 @@ class Plugin:
                     "used": list(game.chain.used[-USED_LIMIT:]),
                     "rounds": game.rounds, "goal": game.goal, "scores": game.scores,
                     "hints_left": game.hints_left, "swaps_left": game.swaps_left,
+                    "rescues_left": game.rescues_left,
                     "last_player": game.last_player, "hint_word": game.hint_word,
                     "sequence_epoch": self.sequence_epoch, "ready_sequence": game.chain.ready_sequence,
                     "idle_seconds": self.idle_seconds,
@@ -189,7 +199,7 @@ class Plugin:
     @staticmethod
     def _progress(game):
         return (f"全群进度 {game.rounds}/{game.goal} · {len(game.scores)} 人参与\n"
-                f"接龙提示 {game.hints_left} 次 · 接龙换题 {game.swaps_left} 次")
+                f"接龙提示 {game.hints_left} 次 · 接龙换题 {game.swaps_left} 次 · 我还能续接 {game.rescues_left} 次")
 
     def _status(self, game):
         return (f"当前成语：{game.chain.current}，请接以“{game.chain.current[-1]}”开头的四字成语。\n"
@@ -228,8 +238,10 @@ class Plugin:
             # 开场允许换开场；续局缺少上一位玩家记录时不伪造衔接。
             if game.last_player:
                 word = judge.lexicon.choose(game.last_player, used, MIN_FOLLOWUPS)
-            elif game.rounds == 0 and len(used) == 1:
+            elif len(used) == 1:
                 options = judge.lexicon.playable(sorted(judge.lexicon.words), used, MIN_FOLLOWUPS)
+                if not options:
+                    options = judge.lexicon.playable(sorted(judge.lexicon.words), used, 1)
                 word = judge.lexicon.rng.choice(options) if options else ""
             else:
                 word = ""
@@ -269,7 +281,7 @@ class Plugin:
             opening = judge.opening()
             new_game = Game(opening, Chain(opening, (opening,)), goal=self.goal)
             reply = (f"全群一起上！接对 {self.goal} 次就通关，答错可以重试。\n{self._status(new_game)}\n"
-                     "同字衔接，本局不重复；我每次出题至少留 3 个常用答案。\n"
+                     "同字衔接，本局不重复；我出题会尽量留足接法，实在接不上就换个开头继续。\n"
                      "直接发成语，或用“/接龙 成语”明确作答；发送“接龙认输”或“退出接龙”结束。")
             if ctx.reply(message, reply, delivery_guard=guard):
                 self._commit(ctx, room, new_game)
@@ -316,12 +328,23 @@ class Plugin:
         scores = dict(game.scores)
         scores[message.sender_id] = scores.get(message.sender_id, 0) + 1
         updated = replace(game, rounds=game.rounds + 1, scores=scores, last_player=answer, hint_word="")
+        if not verdict.next_idiom and updated.rounds < updated.goal and game.rescues_left > 0:
+            # 接不上时先换个开头续接，进度保留；续接用完才认输。
+            opening = judge.opening()
+            rescued = replace(updated, opening=opening, chain=Chain(opening, (opening,)),
+                              last_player="", hint_word="", rescues_left=game.rescues_left - 1)
+            response = (f"{chain.current} → {answer}\n"
+                        f"这个字我接不上，换个开头接着来，进度保留！\n"
+                        f"本局还能续接 {rescued.rescues_left} 次。\n{self._status(rescued)}")
+            if ctx.reply_at(message, response, display_name=name, delivery_guard=guard):
+                self._commit(ctx, room, rescued)
+            return
         won = updated.rounds >= updated.goal or not verdict.next_idiom
         if won:
             title = "全群通关！这局是你们赢了。" if updated.rounds >= updated.goal else "绝杀！这局你们赢了。"
             response = f"{title}\n{chain.current} → {answer}"
             if not verdict.next_idiom and updated.rounds < updated.goal:
-                response += "\n我的常用词池已找不到还能留足 3 个答案的接法，这轮认输。"
+                response += "\n我的常用词池已经找不到能接下去的词，这轮认输。"
             response += (f"\n本局接对 {updated.rounds}/{updated.goal} 次，{len(scores)} 人参与；"
                          f"你贡献了 {scores[message.sender_id]} 次。\n发送“成语接龙”再开一局。")
         else:

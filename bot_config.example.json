@@ -67,7 +67,8 @@
       "enabled": false,
       "member_names": {},
       "idle_seconds": 1800,
-      "target_rounds": 10
+      "target_rounds": 10,
+      "bot_rescues": 3
     },
     "id_responder": {
       "enabled": true

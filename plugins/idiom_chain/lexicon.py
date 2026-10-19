@@ -226,14 +226,20 @@ class Lexicon:
                 len(self.continuations(word, blocked | {word})) >= minimum]
 
     def choose(self, previous, used, minimum=3):
-        candidates = self.playable(self.continuations(previous, used), used, minimum)
-        return self._choose_sustainable(candidates, used, minimum) if candidates else ""
+        """优先留足 minimum 个接法；不足时逐级放宽到 1，避免把可接的题判成死路。"""
+        candidates = self.continuations(previous, used)
+        for floor in range(minimum, 0, -1):
+            options = self.playable(candidates, used, floor)
+            if options:
+                return self._choose_sustainable(options, used, floor)
+        return ""
 
     def opening(self, minimum=3):
-        candidates = self.playable(sorted(self.words), (), minimum)
-        if not candidates:
-            raise ValueError("常用词池没有满足接续数量要求的开场成语")
-        return self._choose_sustainable(candidates, (), minimum)
+        for floor in range(minimum, 0, -1):
+            candidates = self.playable(sorted(self.words), (), floor)
+            if candidates:
+                return self._choose_sustainable(candidates, (), floor)
+        raise ValueError("常用词池没有可接续的开场成语")
 
     def _choose_sustainable(self, candidates, used, minimum):
         """优先保留能继续来回接的答案；玩家仍可用合法绝杀词获胜。"""

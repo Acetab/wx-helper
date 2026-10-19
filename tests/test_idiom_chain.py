@@ -641,8 +641,9 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.plugin.games[ROOM].rounds, 0)
         self.assertEqual(self.plugin.games[ROOM].hints_left, 2)
 
-    def test_bot_has_no_fair_move_concedes_instead_of_skipping(self):
+    def test_bot_concedes_only_after_rescues_run_out(self):
         self.start()
+        self.plugin.games[ROOM].rescues_left = 0
         self.send("意气相投")
         self.send("好高骛远")  # 投其所好后，“远”无可出题项。
         self.assertIn("绝杀", self.ctx.sent[-1][1])
@@ -650,8 +651,21 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertNotIn("大家继续接", self.ctx.sent[-1][1])
         self.assertNotIn(ROOM, self.plugin.games)
 
+    def test_rescue_restarts_chain_and_keeps_progress(self):
+        self.start()
+        self.send("意气相投")
+        self.send("好高骛远")  # 该字在词池中无解，触发续接而不是认输。
+        game = self.plugin.games[ROOM]
+        self.assertIn("换个开头", self.ctx.sent[-1][1])
+        self.assertEqual(game.rounds, 2)
+        self.assertEqual(game.rescues_left, 2)
+        self.assertEqual(len(game.chain.used), 1)  # 新开头重新计数，进度与个人贡献保留
+        self.assertEqual(game.scores, {A: 2})
+        self.assertEqual(self.ctx.sent[-1][2], A)
+
     def test_failed_victory_send_keeps_question_and_score(self):
         self.start()
+        self.plugin.games[ROOM].rescues_left = 0
         with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
             self.ctx.succeeds = False
             self.send("意气风发")
@@ -696,6 +710,24 @@ class IdiomPluginTests(unittest.TestCase):
             self.ctx.config = {"target_rounds": value}
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Plugin().on_load(self.ctx)
+
+    def test_invalid_rescue_configuration(self):
+        for value in (True, -1, 11, "3"):
+            self.ctx.config = {"bot_rescues": value}
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Plugin().on_load(self.ctx)
+
+    def test_rescue_budget_survives_restart(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.start()
+        self.send("意气相投")
+        self.send("好高骛远")
+        self.assertEqual(self.plugin.games[ROOM].rescues_left, 2)
+        self.use_state(state)
+        self.send("接龙状态")
+        game = self.plugin.games[ROOM]
+        self.assertEqual((game.rounds, game.rescues_left, game.scores), (2, 2, {A: 2}))
 
 
 if __name__ == "__main__":

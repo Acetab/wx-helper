@@ -23,10 +23,12 @@ class LexiconTests(unittest.TestCase):
                     self.assertEqual(len(replies), len(set(replies)))
                     self.assertFalse(set(replies) & (used | {word}))
 
-    def test_exhausted_replies_are_not_counted_and_dead_ends_are_excluded(self):
+    def test_threshold_degrades_before_a_dead_end_is_declared(self):
         lexicon = Lexicon(("意气风发", "发扬光大", "发号施令", "大快人心", "大公无私", "大功告成"))
+        # 还有 2 个接法：放宽门槛继续出题，而不是直接认输。
         self.assertEqual(lexicon.choose("意气风发", ("意气风发",)), "发扬光大")
-        self.assertEqual(lexicon.choose("意气风发", ("意气风发", "大快人心")), "")
+        self.assertEqual(lexicon.choose("意气风发", ("意气风发", "大快人心")), "发扬光大")
+        # 唯一候选没有后续，才算真正的死路。
         self.assertEqual(lexicon.choose("意气风发", ("意气风发", "发扬光大")), "")
 
     def test_seeded_games_never_repeat_or_leave_player_without_choices(self):
@@ -36,7 +38,8 @@ class LexiconTests(unittest.TestCase):
             used = {current}
             for _ in range(10):
                 answers = lexicon.continuations(current, used)
-                self.assertGreaterEqual(len(answers), 3)
+                # 门槛会逐级放宽到 1，但绝不把玩家留在无解的死路上。
+                self.assertGreaterEqual(len(answers), 1)
                 player = lexicon.rng.choice(answers)
                 self.assertNotIn(player, used)
                 used.add(player)
