@@ -1,6 +1,8 @@
 {
   "api": "v1",
   "author": "Inmata",
+  "pull_request_author": "Acetab",
+  "contributors": ["Inmata", "Acetab"],
   "description": "全群成语接龙闯关：常用词池出题并留足接法，提供进度、提示、换题与结算；模型复核表外答案",
   "requires": ["group.text.receive", "group.text.send", "group.text.mention"]
 }
