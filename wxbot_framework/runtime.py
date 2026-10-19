@@ -117,6 +117,8 @@ class BotApplication:
             router.submit(message)
             return
         if not allowed or message.chat_id in allowed:
+            # 必须先编号：落库慢时，发题水位仍能排除已经收到但尚未入队的答案。
+            message = self.plugins.capture(message)
             if self.members is not None:
                 try:
                     inserted = self.members.record(message)

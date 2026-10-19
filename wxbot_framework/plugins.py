@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .config import validate_name
 from .sdk import PluginContext, LegacyService
+from .ordering import MessageWatermarks
 
 logger = logging.getLogger("Plugins")
 
@@ -123,6 +124,7 @@ class PluginManager:
         self.member_store = member_store
         self.knowledge_store = knowledge_store
         self.room_state_store = room_state_store
+        self._message_watermarks = MessageWatermarks()
 
     def is_active(self, name):
         with self._lock:
@@ -191,7 +193,8 @@ class PluginManager:
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
                                 member_store=self.member_store, knowledge_store=self.knowledge_store,
                                 room_state_store=self.room_state_store,
-                                display_timezone=self.config.get("display_timezone", "Asia/Shanghai"))
+                                display_timezone=self.config.get("display_timezone", "Asia/Shanghai"),
+                                message_watermarks=self._message_watermarks)
         # 每次使用独立模块名并重新编译源文件，热重载不复用旧入口字节码。
         if "_wxbot_plugins" not in sys.modules:
             package = types.ModuleType("_wxbot_plugins")
@@ -284,7 +287,12 @@ class PluginManager:
                 self.load_errors[target] = str(error)
                 logger.exception("插件 %s 加载失败，其他插件继续运行", target)
 
+    def capture(self, message):
+        return self._message_watermarks.capture(message)
+
     def dispatch(self, message):
+        # 同时支持直接分发（测试/嵌入入口）；正常入口已在落库前 capture。
+        message = self.capture(message)
         with self._lock:
             records = tuple(self.records.values())
         if message.is_group and self.room_state_store is not None:

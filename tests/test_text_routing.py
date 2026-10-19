@@ -61,7 +61,8 @@ class TextRoutingTests(unittest.TestCase):
 
     def test_primary_phone_can_control_and_play_group_game(self):
         self.identify()
-        for text in ("/help", "成语接龙", "合并接龙", "退出接龙", "意气风发"):
+        for text in ("/help", "成语接龙", "合并接龙", "退出接龙", "意气风发",
+                     "接龙提示", "接龙换题", "接龙状态", "接龙认输", "/接龙 意气风发"):
             data = self.router.convert(GROUP, SELF, SELF + ":\n" + text)
             self.assertTrue(data["is_self"])
             self.assertEqual(data["msg"], text)

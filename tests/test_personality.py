@@ -166,6 +166,7 @@ class FixedPersonalityTests(unittest.TestCase):
     def test_runtime_prepares_reset_before_dispatch(self):
         app = object.__new__(BotApplication)
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
+        app.plugins.capture.side_effect = lambda message: message
         self.store.record(self.message("旧消息"))
         snapshot = self.store.recent_snapshot(ROOM)
         app._emit(self.message("/清空"))

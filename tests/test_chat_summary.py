@@ -272,6 +272,7 @@ class DailySummaryTests(unittest.TestCase):
         app = object.__new__(BotApplication)
         app.config = {"chat_allowlist": []}
         app.members, app.plugins = self.store, Mock()
+        app.plugins.capture.side_effect = lambda message: message
         app._emit(Message.from_native(11046, data, "test"))
         app.plugins.dispatch.assert_not_called()
         self.assertEqual(self.store.today_snapshot("主人", ROOM).messages[0]["text"], "普通手机聊天")

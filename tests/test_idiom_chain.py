@@ -10,6 +10,8 @@ from plugins.idiom_chain import FEATURE, Plugin, HELP
 from wxbot_framework.llm import LLMError
 from wxbot_framework.sdk import Message
 from wxbot_framework.personality import PersonalityState
+from wxbot_framework.ordering import MessageWatermarks
+from plugins.idiom_chain.judge import Verdict
 
 ROOM = "12345678@chatroom"
 A, B = "wxid_player_a", "wxid_player_b"
@@ -63,6 +65,14 @@ class Context:
         self.sent = []
         self.succeeds = True
         self.room_state = None
+        self.watermarks = MessageWatermarks()
+
+    def message_watermark(self, room):
+        return self.watermarks.latest(room)
+
+    @property
+    def message_epoch(self):
+        return self.watermarks.epoch
 
     def personality(self, message):
         return PersonalityState(message.chat_id)
@@ -93,12 +103,21 @@ class NoMemberContext(Context):
 
 class IdiomPluginTests(unittest.TestCase):
     def setUp(self):
+        def choose(words):
+            return next((word for word in ("一心一意", "发扬光大", "心口如一") if word in words), words[0])
+        chooser = patch("plugins.idiom_chain.lexicon.random.Random.choice", side_effect=choose)
+        chooser.start()
+        self.addCleanup(chooser.stop)
+        strategy = patch("plugins.idiom_chain.lexicon.Lexicon._choose_sustainable",
+                         side_effect=lambda words, used, minimum: choose(words))
+        strategy.start()
+        self.addCleanup(strategy.stop)
         self.ctx = Context()
         self.plugin = Plugin()
         self.plugin.on_load(self.ctx)
         self.sequence = 0
 
-    def send(self, text, sender=A, room=ROOM, *, session="one", received_at=None, is_self=False,
+    def receive(self, text, sender=A, room=ROOM, *, session="one", received_at=None, is_self=False,
              is_group=True, at_self=False, sequence=None):
         if sequence is None:
             self.sequence += 1
@@ -108,6 +127,10 @@ class IdiomPluginTests(unittest.TestCase):
         message = Message(text, room, sender_id=sender, session_id=session, is_group=is_group,
                           is_self=is_self, received_at=time.monotonic() if received_at is None else received_at,
                           sequence=sequence, data={"is_at_self": at_self})
+        return self.ctx.watermarks.capture(message)
+
+    def send(self, text, *args, **kwargs):
+        message = self.receive(text, *args, **kwargs)
         self.plugin.on_message(message, self.ctx)
         return message
 
@@ -134,12 +157,12 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.ctx.sent[-1][2:], (A, "小明"))
         self.assertIn("发扬光大", self.ctx.sent[-1][1])
         # 第二位玩家接着上一位玩家报出的“大”继续，而不是回到开场成语。
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
         self.assertEqual(self.ctx.sent[-1][2:], (B, "小红"))
-        self.assertIn("大大方方", self.ctx.sent[-1][1])
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
-        self.assertEqual(self.plugin.games[ROOM].chain.used[-2:], ("大大方方", "方兴未艾"))
+        self.assertIn("大快人心", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
+        self.assertEqual(self.plugin.games[ROOM].chain.used[-2:], ("大快人心", "心口如一"))
 
     def test_plain_chat_is_ignored_while_game_runs(self):
         self.start()
@@ -168,42 +191,71 @@ class IdiomPluginTests(unittest.TestCase):
 
     def test_only_first_answer_of_a_round_counts(self):
         self.start()
-        arrived = time.monotonic()
-        self.send("意气风发", A, received_at=arrived, sequence=2)
+        # 判定开始前已进入接收队列的多条抢答，只允许第一条推进本轮。
+        first = self.receive("意气风发", A, received_at=100, sequence=2)
+        queued = self.receive("大快人心", B, received_at=100, sequence=3)
+        self.plugin.on_message(first, self.ctx)
         count = len(self.ctx.sent)
-        # 与第一条答案同一 sequence：模拟判定期间排队、发题后才被处理的消息。
-        self.send("大大方方", B, received_at=arrived + 0.00000001, sequence=2)
+        self.plugin.on_message(queued, self.ctx)
         self.assertEqual(len(self.ctx.sent), count)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
 
-    def test_same_timestamp_later_sequence_is_still_queued(self):
+    def test_equal_clock_tick_later_sequence_is_accepted(self):
+        with patch("plugins.idiom_chain.time.monotonic", return_value=100):
+            self.send("成语接龙", received_at=100, sequence=1)
+            self.send("意气风发", A, received_at=100, sequence=2)
+            self.send("大快人心", B, received_at=100, sequence=3)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 2)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
+
+    def test_all_answers_queued_during_judging_are_ignored(self):
         self.start()
-        arrived = time.monotonic()
-        self.send("意气风发", A, received_at=arrived, sequence=2)
+        queued = []
+        def evaluate(*args):
+            queued.extend(self.receive("大快人心", B, received_at=100) for _ in range(5))
+            return Verdict(True, "有效", "发扬光大")
+        with patch("plugins.idiom_chain.IdiomJudge.evaluate", side_effect=evaluate):
+            self.send("意气风发", received_at=100)
         count = len(self.ctx.sent)
-        self.ctx.llm.result["next_idiom"] = "发扬光大"
-        self.send("大大方方", B, received_at=arrived, sequence=3)
+        for message in queued:
+            self.plugin.on_message(message, self.ctx)
         self.assertEqual(len(self.ctx.sent), count)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+        self.assertEqual(self.plugin.games[ROOM].rounds, 1)
+        self.send("大快人心", B, received_at=100)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 2)
 
-    def test_pre_reply_answer_with_larger_sequence_is_ignored(self):
+    def test_answer_queued_during_send_is_ignored_but_next_one_counts(self):
         self.start()
+        queued = []
+        original = self.ctx.reply_at
+        def reply(*args, **kwargs):
+            queued.append(self.receive("大快人心", B, received_at=100))
+            return original(*args, **kwargs)
+        with patch.object(self.ctx, "reply_at", side_effect=reply):
+            self.send("意气风发", received_at=100)
         count = len(self.ctx.sent)
-        # 发题回复尚未完成时到达：即使 sequence 正常递增也不能进入下一轮。
-        self.send("意气风发", A, received_at=0)
+        self.plugin.on_message(queued[0], self.ctx)
         self.assertEqual(len(self.ctx.sent), count)
+        self.send("大快人心", B, received_at=100)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 2)
 
-    def test_pre_reply_answer_with_larger_message_id_is_ignored(self):
+    def test_pending_answer_with_late_database_id_is_ignored(self):
         members = FakeMembers()
         members.latest = 10
         self.ctx.members = members
-        self.start()
-        members.ids["意气风发"] = 99  # 记录线程晚提交，ID 比发题水位更大。
+        queued = []
+        original = self.ctx.reply
+        def reply(*args, **kwargs):
+            queued.append(self.receive("意气风发", received_at=100))
+            return original(*args, **kwargs)
+        with patch.object(self.ctx, "reply", side_effect=reply):
+            self.start()
+        members.ids["意气风发"] = 99  # 接收后落库延迟，不能用这个较大的 ID 参与新一轮。
         count = len(self.ctx.sent)
-        self.send("意气风发", A, received_at=0)
+        self.plugin.on_message(queued[0], self.ctx)
         self.assertEqual(len(self.ctx.sent), count)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
 
@@ -226,65 +278,30 @@ class IdiomPluginTests(unittest.TestCase):
         self.send("意气风发", A)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
 
-    def test_old_message_id_is_rejected_even_when_sequence_advanced(self):
-        members = FakeMembers()
-        members.latest = 10
-        self.ctx.members = members
-        self.start()
-        members.ids["意气风发"] = 10
-        count = len(self.ctx.sent)
-        self.send("意气风发", A, received_at=0)
-        self.assertEqual(len(self.ctx.sent), count)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
-
     def test_reconnected_sequence_restart_still_counts(self):
         members = FakeMembers()
         members.history_enabled = False
         self.ctx.members = members
-        self.start()
+        self.send("成语接龙", sequence=900, received_at=100)
         self.ctx.llm.result["next_idiom"] = "发扬光大"
-        self.send("意气风发", A, session="two", sequence=1)
+        self.send("意气风发", A, session="two", sequence=1, received_at=100)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
 
-    def test_equal_timestamp_uses_message_id_as_tiebreak(self):
+    def test_new_answer_after_database_id_reuse_does_not_need_clock(self):
         members = FakeMembers()
         members.latest = 10
         self.ctx.members = members
         self.start()
-        game = self.plugin.games[ROOM]
-        game.chain.ready_at = 100.0
-        members.ids["意气风发"] = 11  # ID 大于发题水位。
-        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        members.ids["意气风发"] = 1
         self.send("意气风发", A, received_at=100.0)
-        self.assertEqual(game.chain.current, "发扬光大")
-
-    def test_equal_timestamp_old_message_id_is_ignored(self):
-        members = FakeMembers()
-        members.latest = 10
-        self.ctx.members = members
-        self.start()
-        game = self.plugin.games[ROOM]
-        game.chain.ready_at = 100.0
-        members.ids["意气风发"] = 10  # ID 未超过发题水位。
-        count = len(self.ctx.sent)
-        self.send("意气风发", A, received_at=100.0)
-        self.assertEqual(len(self.ctx.sent), count)
-        self.assertEqual(game.chain.current, "一心一意")
-
-    def test_equal_timestamp_uses_sequence_as_tiebreak(self):
-        self.start()
-        game = self.plugin.games[ROOM]
-        game.chain.ready_at = 100.0
-        self.ctx.llm.result["next_idiom"] = "发扬光大"
-        self.send("意气风发", A, received_at=100.0, sequence=2)
-        self.assertEqual(game.chain.current, "发扬光大")
+        self.assertEqual(self.plugin.games[ROOM].rounds, 1)
 
     def test_answer_queued_before_opening_reply_is_ignored(self):
-        arrived = time.monotonic()
-        self.send("成语接龙", sequence=1)
+        queued = self.receive("意气风发", received_at=100, sequence=1)
+        self.send("成语接龙", received_at=100, sequence=2)
         count = len(self.ctx.sent)
         # 消息在开场题发出前就已到达，只是排队到发题完成后才被插件处理。
-        self.send("意气风发", A, received_at=arrived, sequence=1)
+        self.plugin.on_message(queued, self.ctx)
         self.assertEqual(len(self.ctx.sent), count)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
 
@@ -293,9 +310,9 @@ class IdiomPluginTests(unittest.TestCase):
         self.send("意气风发", A)
         self.send("合并接龙")
         self.assertIn("发扬光大", self.ctx.sent[-1][1])
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
 
     def test_status_command_reports_current_word_without_starting_over(self):
         self.start()
@@ -370,10 +387,33 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(state.data[(ROOM, FEATURE)]["current"], "发扬光大")
         # 重启后换一个插件实例，靠共享状态接着上一局继续。
         self.use_state(state)
-        self.ctx.llm.result["next_idiom"] = "方兴未艾"
-        self.send("大大方方", B)
+        self.ctx.llm.result["next_idiom"] = "心口如一"
+        self.send("大快人心", B)
         self.assertIn("发扬光大", self.ctx.sent[-1][1])
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "心口如一")
+
+    def test_reload_preserves_watermark_for_already_received_old_answers(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        queued = self.receive("意气风发", received_at=100)
+        self.start()
+        self.use_state(state)  # 插件重载，分发器和序号域保持不变。
+        count = len(self.ctx.sent)
+        self.plugin.on_message(queued, self.ctx)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.send("意气风发", received_at=100)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 1)
+
+    def test_new_process_does_not_reuse_previous_process_watermark(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.start()
+        self.send("意气风发", received_at=100)
+        self.ctx.watermarks = MessageWatermarks()  # 模拟重启：接收序号重新从 1 开始。
+        self.use_state(state)
+        self.send("大快人心", B, received_at=100, sequence=1)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 2)
 
     def test_restored_progress_keeps_remaining_idle_time(self):
         state = FakeRoomState()
@@ -445,21 +485,18 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
         self.assertIn("重试", self.ctx.sent[-1][1])
 
-    def test_failed_bot_continuation_commits_player_answer_for_the_next_player(self):
+    def test_model_cannot_skip_bot_turn(self):
         state = FakeRoomState()
         self.use_state(state)
         self.start()
         self.ctx.llm.result["next_idiom"] = "假的"
         self.send("意气风发", A)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "意气风发")
-        self.assertEqual(self.plugin.games[ROOM].chain.used, ("一心一意", "意气风发"))
-        self.assertEqual(state.data[(ROOM, FEATURE)]["current"], "意气风发")
-        self.assertIn("发", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+        self.assertEqual(self.plugin.games[ROOM].chain.used, ("一心一意", "意气风发", "发扬光大"))
+        self.assertEqual(state.data[(ROOM, FEATURE)]["current"], "发扬光大")
+        self.assertIn("1/10", self.ctx.sent[-1][1])
         self.assertNotIn("暂时无法判定", self.ctx.sent[-1][1])
         self.assertNotIn("我接：意气风发", self.ctx.sent[-1][1])
-        self.ctx.llm.result["next_idiom"] = "大有可为"
-        self.send("发扬光大", B)
-        self.assertEqual(self.plugin.games[ROOM].chain.current, "大有可为")
 
     def test_failed_send_keeps_original_question_even_when_bot_cannot_continue(self):
         self.start()
@@ -469,10 +506,10 @@ class IdiomPluginTests(unittest.TestCase):
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
         self.assertEqual(self.plugin.games[ROOM].chain.used, ("一心一意",))
 
-    def test_model_opening_failure_does_not_create_game(self):
-        with patch("plugins.idiom_chain.IdiomJudge.opening", side_effect=LLMError("测试超时")), self.assertLogs("IdiomTests"):
+    def test_opening_does_not_need_model(self):
+        with patch.object(self.ctx.llm, "complete_json", side_effect=LLMError("测试超时")):
             self.send("成语接龙")
-        self.assertEqual(self.plugin.games, {})
+        self.assertIn(ROOM, self.plugin.games)
 
     def test_idle_game_expires_and_is_not_treated_as_chain(self):
         self.start()
@@ -495,6 +532,168 @@ class IdiomPluginTests(unittest.TestCase):
     def test_invalid_idle_configuration(self):
         for value in (True, 0, 59, 86401, "1800"):
             self.ctx.config = {"member_names": {}, "idle_seconds": value}
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Plugin().on_load(self.ctx)
+
+    def test_progress_and_scores_survive_restart_without_refilling_help(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.start()
+        self.send("意气风发", A)
+        self.send("接龙提示")
+        saved_hint = self.plugin.games[ROOM].hint_word
+        self.use_state(state)
+        self.send("接龙状态")
+        game = self.plugin.games[ROOM]
+        self.assertEqual((game.rounds, game.scores, game.hints_left, game.hint_word), (1, {A: 1}, 1, saved_hint))
+        self.send("大快人心", B)
+        self.assertEqual(self.plugin.games[ROOM].scores, {A: 1, B: 1})
+        self.assertIn("2/10", self.ctx.sent[-1][1])
+        self.assertIn("2 人参与", self.ctx.sent[-1][1])
+
+    def test_explicit_answer_explains_bad_prefix_and_bad_length(self):
+        self.start()
+        for text in ("/接龙 异想天开", "/接龙 意气风发啊", "/接龙", "/接龙 意气风发！"):
+            with self.subTest(text=text):
+                self.send(text)
+                self.assertIn("不扣进度", self.ctx.sent[-1][1])
+                self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.send("/接龙\t意气风发", is_self=True)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 1)
+
+    def test_help_and_explicit_answer_require_a_game(self):
+        for text in ("接龙提示", "接龙换题", "接龙状态", "/接龙 意气风发"):
+            self.send(text)
+            self.assertIn("请先", self.ctx.sent[-1][1])
+
+    def test_hint_has_real_unused_answer_and_cannot_be_refilled(self):
+        self.start()
+        self.send("接龙提示")
+        game = self.plugin.games[ROOM]
+        self.assertIn(game.hint_word, self.plugin.judge.lexicon.continuations(game.chain.current, game.chain.used))
+        self.assertNotIn(game.hint_word, self.ctx.sent[-1][1])
+        self.assertIn(game.hint_word[0] + "□□" + game.hint_word[-1], self.ctx.sent[-1][1])
+        self.send("接龙提示")
+        self.assertIn(game.hint_word[:2] + "□" + game.hint_word[-1], self.ctx.sent[-1][1])
+        self.send("接龙提示")
+        self.assertIn("已经用完", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].hints_left, 0)
+
+    def test_failed_hint_or_swap_send_does_not_consume_budget(self):
+        self.start()
+        game = self.plugin.games[ROOM]
+        self.ctx.succeeds = False
+        for text in ("接龙提示", "接龙换题"):
+            self.send(text)
+            self.assertEqual(self.plugin.games[ROOM], game)
+        self.ctx.succeeds = True
+        self.send("接龙换题")
+        self.assertNotEqual(self.plugin.games[ROOM].chain.current, game.chain.current)
+        self.assertEqual(self.plugin.games[ROOM].swaps_left, 0)
+        self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.send("接龙换题")
+        self.assertIn("已经用完", self.ctx.sent[-1][1])
+
+    def test_swap_preserves_player_move_scores_and_history(self):
+        self.start()
+        self.send("意气风发")
+        self.send("大快人心", B)
+        game = self.plugin.games[ROOM]
+        self.send("接龙换题")
+        new = self.plugin.games[ROOM]
+        self.assertEqual(new.rounds, 2)
+        self.assertEqual(new.scores, {A: 1, B: 1})
+        self.assertEqual(new.chain.current[0], "心")
+        self.assertNotEqual(new.chain.current, game.chain.current)
+        self.assertEqual(new.chain.used[:-1], game.chain.used)
+        self.assertGreaterEqual(len(self.plugin.judge.lexicon.continuations(new.chain.current, new.chain.used)), 3)
+
+    def test_no_alternative_does_not_spend_swap(self):
+        self.start()
+        self.send("意气风发")
+        self.send("接龙换题")
+        self.assertIn("不扣", self.ctx.sent[-1][1])
+        self.assertEqual(self.plugin.games[ROOM].swaps_left, 1)
+
+    def test_stale_help_message_does_not_spend_budget(self):
+        queued = self.receive("接龙提示", received_at=100)
+        self.start()
+        count = len(self.ctx.sent)
+        self.plugin.on_message(queued, self.ctx)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].hints_left, 2)
+
+    def test_clear_victory_at_target_and_fresh_game_afterwards(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.plugin.goal = 3
+        self.start()
+        self.send("意气风发", A)
+        self.send("大快人心", B)
+        self.assertIn("最后一棒", self.ctx.sent[-1][1])
+        self.send("一鸣惊人", A)
+        self.assertIn("全群通关", self.ctx.sent[-1][1])
+        self.assertIn("3/3", self.ctx.sent[-1][1])
+        self.assertIn("你贡献了 2 次", self.ctx.sent[-1][1])
+        self.assertNotIn(ROOM, self.plugin.games)
+        self.assertNotIn((ROOM, FEATURE), state.data)
+        self.start()
+        self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+        self.assertEqual(self.plugin.games[ROOM].hints_left, 2)
+
+    def test_bot_has_no_fair_move_concedes_instead_of_skipping(self):
+        self.start()
+        self.send("意气相投")
+        self.send("好高骛远")  # 投其所好后，“远”无可出题项。
+        self.assertIn("绝杀", self.ctx.sent[-1][1])
+        self.assertIn("常用词池", self.ctx.sent[-1][1])
+        self.assertNotIn("大家继续接", self.ctx.sent[-1][1])
+        self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_failed_victory_send_keeps_question_and_score(self):
+        self.start()
+        with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
+            self.ctx.succeeds = False
+            self.send("意气风发")
+            self.assertEqual(self.plugin.games[ROOM].rounds, 0)
+            self.ctx.succeeds = True
+            self.send("意气风发")
+        self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_surrender_reveals_real_answers_and_failed_exit_keeps_game(self):
+        self.start()
+        self.ctx.succeeds = False
+        self.send("接龙认输")
+        self.assertIn(ROOM, self.plugin.games)
+        self.ctx.succeeds = True
+        self.send("接龙认输")
+        self.assertIn("刚才可以接", self.ctx.sent[-1][1])
+        self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_unknown_word_model_outage_does_not_change_progress(self):
+        self.start()
+        before = self.plugin.games[ROOM]
+        with patch.object(self.ctx.llm, "complete_json", side_effect=LLMError("超时")), self.assertLogs("IdiomTests"):
+            self.send("意料之外")
+        self.assertEqual(self.plugin.games[ROOM].rounds, before.rounds)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, before.chain.current)
+        self.assertEqual(self.plugin.games[ROOM].scores, {})
+
+    def test_invalid_saved_counters_are_not_restored(self):
+        state = FakeRoomState()
+        self.use_state(state)
+        self.start()
+        good = state.data[(ROOM, FEATURE)].copy()
+        for changes in ({"rounds": True}, {"goal": 0}, {"hints_left": -1}, {"swaps_left": 2},
+                        {"scores": {A: True}}, {"rounds": 1}, {"scores": []}):
+            state.data[(ROOM, FEATURE)] = {**good, **changes}
+            self.use_state(state)
+            self.send("接龙状态")
+            self.assertNotIn(ROOM, self.plugin.games)
+
+    def test_invalid_goal_configuration(self):
+        for value in (True, 0, 2, 31, "10"):
+            self.ctx.config = {"target_rounds": value}
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Plugin().on_load(self.ctx)
 

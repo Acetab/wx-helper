@@ -51,6 +51,22 @@ class RoomGameTests(unittest.TestCase):
         plugin.room_state = FakeRoomState(active_game())
         self.assertEqual(plugin.room_game(ROOM, CTX)["current"], "一心一意")
 
+    def test_game_context_includes_real_goal_and_remaining_help(self):
+        context = Plugin.game_context(active_game(rounds=4, goal=10, hints_left=1, swaps_left=0))
+        self.assertEqual((context["rounds"], context["goal"], context["hints_left"], context["swaps_left"]),
+                         (4, 10, 1, 0))
+
+    def test_game_commands_are_not_answered_by_chat(self):
+        plugin = Plugin()
+        ctx = Mock()
+        plugin.members = Mock(account="wxid_robot", groups={ROOM})
+        for text in ("接龙提示", "接龙换题", "接龙认输", "接龙状态", "/接龙 意气风发"):
+            message = Message("@机器人\u2005" + text, ROOM, sender_id="wxid_player", is_group=True,
+                              data={"is_at_self": True, "at_members": ("wxid_robot",)})
+            plugin.on_message(message, ctx)
+        ctx.knowledge.search.assert_not_called()
+        ctx.reply_at.assert_not_called()
+
     def test_room_game_ignores_expired_or_invalid_progress(self):
         plugin = Plugin()
         now = datetime.now(timezone.utc)

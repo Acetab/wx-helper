@@ -34,6 +34,9 @@ class Message:
     session_id: str = ""
     received_at: float = field(default_factory=time.monotonic)
     data: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    # 进程内接收序号；框架入口分配，原生 sequence 仍保留用于桥接诊断。
+    dispatch_sequence: int = 0
+    dispatch_epoch: str = ""
 
     @classmethod
     def from_native(cls, protocol, data, session_id):
@@ -161,7 +164,7 @@ class LegacyService:
 
 class PluginContext:
     def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None,
-                 knowledge_store=None, room_state_store=None, display_timezone=None):
+                 knowledge_store=None, room_state_store=None, display_timezone=None, message_watermarks=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -173,6 +176,15 @@ class PluginContext:
         self._knowledge = knowledge_store
         self._room_state = room_state_store
         self.display_timezone = display_timezone
+        self._message_watermarks = message_watermarks
+
+    def message_watermark(self, room):
+        """当前群已进入框架的最大接收序号，包含仍在落库或排队的消息。"""
+        return self._message_watermarks.latest(room) if self._message_watermarks is not None else 0
+
+    @property
+    def message_epoch(self):
+        return self._message_watermarks.epoch if self._message_watermarks is not None else ""
 
     @property
     def members(self):
