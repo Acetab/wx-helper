@@ -3,7 +3,7 @@ import json
 import sqlite3
 from contextlib import closing
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import test_chat_summary as daily
@@ -190,6 +190,55 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(items[0]["sources"][0]["origin"].startswith("seed:"))
         self.assertEqual(items[0]["revision"], revision)
 
+    def test_seed_import_preserves_forgotten_item_and_quarantined_person(self):
+        kb = self.kb()
+        seed = self.root / "seed.json"
+        seed.write_text(json.dumps({"groups": {ROOM: [{"name": "种子人物", "memories": [
+            {"key": "回归", "kind": "群内玩笑", "content": "种子内容"}]}]}}), encoding="utf-8")
+        kb.import_seed(seed)
+        item = kb.search(ROOM, "种子人物")[0]
+        entity_id = item["entity_id"]
+        kb.edit(ROOM, item["id"], CAT, forget=True)
+        kb.quarantine_person(ROOM, f"#{entity_id}", CAT)
+        with kb._lock, kb._db() as db:
+            db.execute("UPDATE knowledge_entities SET pinned=0,aliases='[]' WHERE id=?", (entity_id,))
+        before = kb.admin_entity(ROOM, f"#{entity_id}")
+        seed.write_text(json.dumps({"groups": {ROOM: [{"name": "种子人物", "aliases": ["新别名"],
+            "memories": [
+                {"key": "回归", "kind": "群内玩笑", "content": "种子内容"},
+                {"key": "隔离后新增", "kind": "群内玩笑", "content": "不应写入"}]}]}}), encoding="utf-8")
+        kb.import_seed(seed)
+        self.assertEqual(kb.admin_item(ROOM, item["id"])["status"], "forgotten")
+        after = kb.admin_entity(ROOM, f"#{entity_id}")
+        self.assertEqual(after["status"], "quarantined")
+        self.assertEqual(after["pinned"], before["pinned"])
+        self.assertEqual(after["aliases"], before["aliases"])
+        _, count, rows = kb.admin_items(ROOM, f"#{entity_id}")
+        self.assertEqual(count, 1)
+        self.assertEqual([row["slot"] for row in rows], ["回归"])
+
+    def test_group_seed_lands_in_group_memory_and_is_idempotent(self):
+        kb = self.kb()
+        seed = self.root / "group-seed.json"
+        seed.write_text(json.dumps({"groups": {ROOM: [
+            {"name": "本群", "aliases": [], "memories": [
+                {"key": "群梗", "kind": "群内玩笑", "content": "大家都爱摸鱼"}]},
+            {"name": "示例甲", "aliases": ["甲哥"], "memories": [
+                {"key": "爱好", "kind": "人工确认", "content": "喜欢吉他"}]},
+        ]}}), encoding="utf-8")
+        kb.import_seed(seed)
+        kb.import_seed(seed)
+        kb.initialize(seed)
+        keys = [entity["entity_key"] for entity in kb._entities(ROOM)]
+        self.assertNotIn("person:本群", keys)
+        self.assertIn("group:本群", keys)
+        group = kb.group_entity(ROOM)
+        count = kb._db().execute("SELECT COUNT(*) FROM knowledge_items WHERE entity_id=? AND slot='群梗'",
+                                 (group["id"],)).fetchone()[0]
+        self.assertEqual(count, 1)
+        self.assertEqual(len(kb.search(ROOM, "摸鱼")), 1)
+        self.assertEqual(kb.find_person(ROOM, "甲哥")["name"], "示例甲")
+
     def test_manual_sqlite_alias_edits_self_heal_on_initialize(self):
         kb = self.kb()
         seed = self.root / "seed.json"
@@ -207,14 +256,18 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(kb.find_person(ROOM, "外号A")["name"], "人物乙")
         self.assertEqual(json.loads(kb.find_person(ROOM, "人物甲")["aliases"]), [])
 
-    def test_import_promotes_existing_candidate_and_adds_explicit_alias(self):
+    def test_people_are_created_only_by_admin_confirmation(self):
         kb = self.kb()
-        candidate = kb.entity(ROOM, "新人物")
-        self.assertFalse(kb.visible(candidate))
+        # 随口提到的名字不再建档，也不会进入检索与模型上下文。
+        with self.assertRaises(MemberError):
+            kb.entity(ROOM, "新人物")
+        self.assertIsNone(kb.resolve_person(ROOM, "新人物"))
+        self.assertEqual(kb.lookup_people(ROOM, "新人物是谁"), [])
+        # 管理员确认后才建档，且可补别名并立即可见。
         promoted = kb.entity(ROOM, "新人物", aliases=["新外号"], pinned=True)
-        self.assertEqual(promoted["id"], candidate["id"])
         self.assertTrue(kb.visible(promoted))
-        self.assertEqual(kb.find_person(ROOM, "新外号")["id"], candidate["id"])
+        self.assertEqual(kb.find_person(ROOM, "新外号")["id"], promoted["id"])
+        self.assertEqual(kb.lookup_people(ROOM, "新人物是谁")[0]["name"], "新人物")
 
     def test_worker_persists_source_and_cursor_atomically(self):
         kb = self.kb()
@@ -250,17 +303,90 @@ class MemoryTests(unittest.TestCase):
         client.complete_json.assert_not_called()
         self.assertGreater(kb.cursor(ROOM), 0)
 
-    def test_high_frequency_person_needs_three_messages_two_speakers(self):
+    def test_group_memory_needs_three_messages_two_speakers(self):
         kb = self.kb()
-        entity = kb.entity(ROOM, "群外人物")
+        group = kb.group_entity(ROOM)
+        first = self.record("这是群梗：摸鱼", sender=CAT, sequence=1)
+        second = self.record("又开始摸鱼了", sender=OTHER, sequence=2)
+        first_id, second_id = self.store.message_id(first), self.store.message_id(second)
+        with kb._lock, kb._db():
+            item = kb.put(ROOM, group["id"], "摸鱼梗", "群内玩笑", "本群把偷懒叫摸鱼",
+                          sources=[{"id": first_id, "sender_id": CAT, "received_at": "2026-10-10"},
+                                   {"id": second_id, "sender_id": OTHER, "received_at": "2026-10-10"}])
+        self.assertEqual(kb.search(ROOM, "摸鱼"), [])
+        self.assertEqual(kb.admin_item(ROOM, item)["status"], "candidate")
+        third = self.record("摸鱼摸鱼", sender=CAT, sequence=3)
+        third_id = self.store.message_id(third)
+        with kb._lock, kb._db():
+            kb.put(ROOM, group["id"], "摸鱼梗", "群内玩笑", "本群把偷懒叫摸鱼",
+                    sources=[{"id": third_id, "sender_id": CAT, "received_at": "2026-10-10"}])
+        self.assertEqual(len(kb.search(ROOM, "摸鱼")), 1)
+        self.assertEqual(kb.admin_item(ROOM, item)["status"], "active")
+
+    def test_stale_group_candidates_are_archived_but_kept(self):
+        kb = self.kb()
+        group = kb.group_entity(ROOM)
+        msg = self.record("只有一条证据")
+        msg_id = self.store.message_id(msg)
+        with kb._lock, kb._db():
+            item = kb.put(ROOM, group["id"], "孤立梗", "群内玩笑", "只有一条证据的梗",
+                          sources=[{"id": msg_id, "sender_id": CAT, "received_at": "2026-10-10"}])
+        self.assertEqual(kb.admin_item(ROOM, item)["status"], "candidate")
         with kb._lock, kb._db() as db:
-            kb.put(ROOM, entity["id"], "话题", "他人提及", "常聊电影")
-            for number, sender in ((1, CAT), (2, CAT)):
-                db.execute("INSERT INTO knowledge_mentions VALUES(?,?,?)", (entity["id"], number, sender))
-        self.assertEqual(kb.search(ROOM, "群外人物"), [])
+            db.execute("UPDATE knowledge_items SET updated_at='2026-01-01T00:00:00+00:00' WHERE id=?", (item,))
+        self.assertEqual(kb.archive_stale_candidates(ROOM), 1)
+        archived = kb.admin_item(ROOM, item)
+        self.assertEqual(archived["status"], "archived")
+        self.assertEqual(archived["content"], "只有一条证据的梗")
+        self.assertTrue(kb._db().execute("SELECT 1 FROM knowledge_sources WHERE item_id=?", (item,)).fetchone())
+
+    def test_new_evidence_refreshes_group_candidate_and_prevents_archive(self):
+        kb = self.kb()
+        group = kb.group_entity(ROOM)
+        first = self.record("第一条证据", sender=CAT, sequence=1)
+        with kb._lock, kb._db():
+            item = kb.put(ROOM, group["id"], "持续话题", "群内玩笑", "持续有证据的话题",
+                          sources=[{"id": self.store.message_id(first), "sender_id": CAT,
+                                    "received_at": "2026-10-10"}])
         with kb._lock, kb._db() as db:
-            db.execute("INSERT INTO knowledge_mentions VALUES(?,?,?)", (entity["id"], 3, OTHER))
-        self.assertEqual(len(kb.search(ROOM, "群外人物")), 1)
+            db.execute("UPDATE knowledge_items SET updated_at='2026-01-01T00:00:00+00:00' WHERE id=?", (item,))
+        second = self.record("第二条证据", sender=OTHER, sequence=2)
+        with kb._lock, kb._db():
+            kb.put(ROOM, group["id"], "持续话题", "群内玩笑", "持续有证据的话题",
+                   sources=[{"id": self.store.message_id(second), "sender_id": OTHER,
+                             "received_at": "2026-10-10"}])
+        refreshed = kb.admin_item(ROOM, item)
+        self.assertNotEqual(refreshed["updated_at"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(refreshed["status"], "candidate")
+        self.assertEqual(kb.archive_stale_candidates(ROOM), 0)
+
+    def test_archived_group_candidate_revives_with_new_evidence(self):
+        kb = self.kb()
+        group = kb.group_entity(ROOM)
+        first = self.record("旧证据", sender=CAT, sequence=1)
+        with kb._lock, kb._db():
+            item = kb.put(ROOM, group["id"], "复活话题", "群内玩笑", "曾被归档的话题",
+                          sources=[{"id": self.store.message_id(first), "sender_id": CAT,
+                                    "received_at": "2026-10-10"}])
+        with kb._lock, kb._db() as db:
+            db.execute("UPDATE knowledge_items SET updated_at='2026-01-01T00:00:00+00:00' WHERE id=?", (item,))
+        self.assertEqual(kb.archive_stale_candidates(ROOM), 1)
+        self.assertEqual(kb.admin_item(ROOM, item)["status"], "archived")
+        second = self.record("新证据", sender=OTHER, sequence=2)
+        with kb._lock, kb._db():
+            kb.put(ROOM, group["id"], "复活话题", "群内玩笑", "曾被归档的话题",
+                   sources=[{"id": self.store.message_id(second), "sender_id": OTHER,
+                             "received_at": "2026-10-10"}])
+        self.assertEqual(kb.admin_item(ROOM, item)["status"], "candidate")
+        self.assertEqual(kb.archive_stale_candidates(ROOM), 0)
+
+    def test_history_window_stops_after_thirty_minutes_silence(self):
+        self.record("很久以前的话")
+        self.now += timedelta(minutes=45)
+        self.record("中间的话")
+        current = self.record("现在又说话了")
+        history = [row["text"] for row in self.store.conversation_snapshot(current).history]
+        self.assertEqual(history, ["中间的话"])
 
     def test_style_requires_thirty_samples_and_preserves_source_ids(self):
         kb = self.kb()
@@ -284,6 +410,44 @@ class MemoryTests(unittest.TestCase):
         plugin.on_message(self.record("@机器人\u2005/help"), self.ctx)
         self.assertIn("/记忆", "".join(row[1] for row in self.backend.sent))
 
+    def test_help_hides_admin_commands_from_ordinary_members(self):
+        kb = self.kb()
+        plugin = KnowledgePlugin()
+        plugin.on_load(self.ctx)
+        self.ctx._knowledge = kb
+        plugin.on_message(self.record("@机器人\u2005/help", sender=OTHER), self.ctx)
+        text = "".join(row[1] for row in self.backend.sent)
+        self.assertIn("/记忆", text)
+        self.assertNotIn("/绑定", text)
+        self.assertNotIn("/管理", text)
+
+    def test_other_members_can_look_up_a_bound_person_by_name(self):
+        kb = self.kb()
+        person = kb.entity(ROOM, "朱宏旭", aliases=["小朱"], pinned=True)
+        self.record("我是朱宏旭", sender=OTHER)
+        kb.link(ROOM, OTHER, "朱宏旭", CAT)
+        profiles = kb.lookup_people(ROOM, "朱宏旭是谁？")
+        self.assertEqual(profiles[0]["name"], "朱宏旭")
+        self.assertTrue(profiles[0]["bound"])
+        self.assertIn("小朱", profiles[0]["aliases"])
+        self.assertEqual(person["id"], kb.find_person(ROOM, "朱宏旭")["id"])
+        # 未建档或已隔离的名字不会凭空出现
+        self.assertEqual(kb.lookup_people(ROOM, "另一个人是谁？"), [])
+
+    def test_profile_and_memory_replies_hide_internal_fields(self):
+        kb = self.kb()
+        plugin = KnowledgePlugin()
+        plugin.on_load(self.ctx)
+        self.ctx._knowledge = kb
+        person = kb.entity(ROOM, "朱宏旭", aliases=["小朱"], pinned=True)
+        kb.add_memory(ROOM, person["id"], "身份", "人工确认", "群里的吉他手", CAT)
+        plugin.on_message(self.record("@机器人\u2005/档案 小朱"), self.ctx)
+        text = "".join(row[1] for row in self.backend.sent)
+        self.assertIn("朱宏旭", text)
+        self.assertIn("群里的吉他手", text)
+        for hidden in ("entity_key", "learning_floor", "{", "}", "wxid"):
+            self.assertNotIn(hidden, text)
+
     def test_migration_backs_up_existing_database_once(self):
         legacy = self.root / "legacy.sqlite3"
         with closing(sqlite3.connect(legacy)) as db:
@@ -299,9 +463,23 @@ class MemoryTests(unittest.TestCase):
 
     def test_invalid_background_config_is_rejected(self):
         for config in ({"memory": []}, {"hourly_chat": {"start_hour": 24}},
+                       {"hourly_chat": {"stale_candidate_minutes": 0}},
                        {"memory": {"batch_size": True}}, {"memory": {"flush_seconds": 0}}):
             with self.assertRaises(ValueError):
                 feature_options(config)
+
+    def test_end_hour_24_is_accepted(self):
+        _, hourly = feature_options({"hourly_chat": {"end_hour": 24}})
+        self.assertEqual(hourly["end_hour"], 24)
+
+    def test_narrow_windows_do_not_require_evening_start_inside(self):
+        for settings in ({"start_hour": 22, "end_hour": 23},
+                         {"start_hour": 23, "end_hour": 24},
+                         {"start_hour": 19, "end_hour": 23}):
+            with self.subTest(settings=settings):
+                _, hourly = feature_options({"hourly_chat": settings})
+                self.assertEqual(hourly["start_hour"], settings["start_hour"])
+                self.assertEqual(hourly["end_hour"], settings["end_hour"])
 
     def test_correcting_a_joke_does_not_turn_it_into_a_real_event(self):
         kb = self.kb()
@@ -402,97 +580,143 @@ class HourlyTests(unittest.TestCase):
     record = MemoryTests.record
     kb = MemoryTests.kb
 
-    def scheduler(self, client=None):
-        self.now = self.now.replace(hour=1, minute=59, second=59)  # 北京09:59:59。
-        client = client or Mock(complete_json=Mock(return_value={"topic": "吉他练习", "text": "刚才聊到吉他，你们最近在练什么曲子？"}))
-        return HourlyScheduler(self.kb(), self.service, client, now=lambda: self.now)
+    def scheduler(self, client=None, **options):
+        self.now = self.now.replace(hour=2, minute=0, second=0)  # 北京10:00。
+        client = client or Mock(complete_json=Mock(return_value={
+            "speak": True, "topic": "吉他练习", "text": "刚才聊到吉他，你们最近在练什么曲子？"}))
+        options.setdefault("run_id", "run-one")
+        return HourlyScheduler(self.kb(), self.service, client, now=lambda: self.now, **options)
 
-    def due(self, scheduler):
-        self.record("最近在练吉他")
-        self.now += timedelta(seconds=1)
+    def activity(self, scheduler):
+        self.record("最近在练吉他", sender=CAT)
+        self.record("我想学一首新曲子", sender=OTHER)
+        self.now += timedelta(minutes=1)
+        scheduler.next_candidate[ROOM] = self.now
         scheduler.tick()
+
+    def candidate_statuses(self, scheduler):
+        with scheduler.knowledge._lock:
+            return [row[0] for row in scheduler.knowledge._db().execute(
+                "SELECT status FROM proactive_candidates WHERE account=? AND room=? ORDER BY id",
+                (ROBOT, ROOM))]
 
     def test_active_hour_sends_once_with_no_raw_member_ids(self):
         scheduler = self.scheduler()
-        self.due(scheduler)
+        self.record("最近在练吉他", sender=CAT)
+        self.record("我想学一首新曲子", sender=OTHER)
+        self.now += timedelta(minutes=1)
+        scheduler.next_candidate[ROOM] = self.now
         scheduler.tick()
-        scheduler.run_slot(ROOM, self.now.astimezone(daily.timezone(timedelta(hours=8))))
         self.assertEqual(len(self.backend.sent), 1)
-        self.assertNotIn(CAT, scheduler.client.complete_json.call_args.args[1])
+        self.assertNotIn(CAT, scheduler.model.client.complete_json.call_args.args[1])
         self.assertNotIn("@", self.backend.sent[0][1])
+        result = json.loads(scheduler.model.client.complete_json.call_args.args[1])
+        self.assertEqual(set(result), {"recent", "knowledge", "recent_topics"})
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
+        self.assertEqual(self.candidate_statuses(scheduler), ["sent"])
 
     def test_empty_room_and_only_commands_do_not_generate(self):
         scheduler = self.scheduler()
         self.record("/help")
         self.store.record(self.message("机器人输出", data={"bot_generated": True}))
-        self.now += timedelta(seconds=1)
+        scheduler.next_candidate[ROOM] = self.now
         scheduler.tick()
         self.assertEqual(self.backend.sent, [])
-        scheduler.client.complete_json.assert_not_called()
+        scheduler.model.client.complete_json.assert_not_called()
 
     def test_midnight_is_silent(self):
+        scheduler = self.scheduler(run_id="night")
         self.now = self.now.replace(hour=15, minute=59, second=59)
-        scheduler = HourlyScheduler(self.kb(), self.service, Mock(), now=lambda: self.now)
-        self.due(scheduler)
+        self.record("夜间聊天", sender=CAT)
+        self.record("夜间接话", sender=OTHER)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
+        self.assertEqual(scheduler.next_candidate[ROOM].hour, 1)  # 北京次日09:00。
         self.assertEqual(self.backend.sent, [])
+        scheduler.model.client.complete_json.assert_not_called()
 
     def test_offline_does_not_catch_up_after_reconnect(self):
         scheduler = self.scheduler()
         self.service.close()
-        self.due(scheduler)
+        self.record("离线前的话一", sender=CAT)
+        self.record("离线前的话二", sender=OTHER)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
+        self.assertEqual(self.backend.sent, [])
+        scheduler.model.client.complete_json.assert_not_called()
+        self.assertGreater(scheduler.next_candidate[ROOM], self.now)
         self.backend = daily.Backend()
         self.service.bind(self.backend)
         scheduler.tick()
         self.assertEqual(self.backend.sent, [])
+        scheduler.model.client.complete_json.assert_not_called()
 
     def test_repeated_topic_is_skipped_next_hour(self):
         scheduler = self.scheduler()
-        self.due(scheduler)
-        self.now += timedelta(minutes=59, seconds=59)
-        self.record("吉他又练了一会")
-        self.now += timedelta(seconds=1)
+        self.activity(scheduler)
+        scheduler.model.client = Mock(complete_json=Mock(return_value={
+            "speak": True, "topic": "吉他练习", "text": "吉他又练了一会，你们下次准备弹什么？"}))
+        self.now += timedelta(minutes=46)
+        self.record("吉他又练了一会", sender=CAT)
+        self.record("想换一首慢歌", sender=OTHER)
+        scheduler.next_candidate[ROOM] = self.now
         scheduler.tick()
         self.assertEqual(len(self.backend.sent), 1)
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
+        self.assertEqual(self.candidate_statuses(scheduler)[-1], "failed")
 
     def test_reset_during_generation_prevents_send(self):
         def generate(*args, **kwargs):
             self.store.reset_context(ROOM)
-            return {"topic": "过时话题", "text": "这句话不应发出"}
+            return {"speak": True, "topic": "过时话题",
+                    "text": "这句话不应发出，因为生成期间上下文已经清空。"}
         scheduler = self.scheduler(Mock(complete_json=generate))
-        self.due(scheduler)
+        self.activity(scheduler)
         self.assertEqual(self.backend.sent, [])
+        self.assertEqual(self.candidate_statuses(scheduler)[-1], "failed")
 
     def test_reset_during_send_pacing_prevents_native_send(self):
         scheduler = self.scheduler()
         cancel = Mock(is_set=lambda: False)
         cancel.wait = lambda _: self.store.reset_context(ROOM) or False
         self.service._cancel = cancel
-        self.due(scheduler)
+        self.record("最近在练吉他", sender=CAT)
+        self.record("我想学一首新曲子", sender=OTHER)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
         self.assertEqual(self.backend.sent, [])
 
-    def test_existing_claim_after_crash_is_not_resent(self):
-        scheduler = self.scheduler()
-        self.record("新话题")
-        self.now += timedelta(seconds=1)
+    def test_previous_run_scheduled_candidate_is_marked_missed(self):
+        scheduler = self.scheduler(run_id="new-run")
         with scheduler.knowledge._lock, scheduler.knowledge._db() as db:
-            db.execute("INSERT INTO hourly_runs VALUES(?,?,?,'claimed','',0,?)",
-                       (ROBOT, ROOM, self.now.astimezone(daily.timezone(timedelta(hours=8))).isoformat(),
-                        scheduler.knowledge.now()))
-        scheduler.tick()
+            db.execute("""INSERT INTO proactive_candidates
+                (account,room,run_id,due_at,status,anchor_id,context_generation,created_at,updated_at)
+                VALUES(?,?,?,?,'scheduled',0,0,?,?)""",
+                (ROBOT, ROOM, "old-run", self.now.isoformat(), self.now.isoformat(), self.now.isoformat()))
+        restarted = HourlyScheduler(scheduler.knowledge, self.service,
+                                    Mock(complete_json=Mock()), now=lambda: self.now,
+                                    run_id="restarted")
+        statuses = self.candidate_statuses(restarted)
+        self.assertEqual(statuses[0], "missed")
+        self.assertEqual(restarted.model.client.complete_json.call_count, 0)
         self.assertEqual(self.backend.sent, [])
 
-    def test_missed_slot_is_not_backfilled(self):
+    def test_stale_candidate_is_not_backfilled_after_suspend(self):
         scheduler = self.scheduler()
-        self.record("新聊天")
-        self.now += timedelta(minutes=5)
+        self.activity(scheduler)
+        self.assertEqual(len(self.backend.sent), 1)
+        self.assertEqual(self.candidate_statuses(scheduler), ["sent"])
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
+        scheduler.next_candidate[ROOM] = self.now - timedelta(minutes=16)
         scheduler.tick()
-        self.assertEqual(self.backend.sent, [])
+        self.assertEqual(len(self.backend.sent), 1)
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
+        self.assertGreater(scheduler.next_candidate[ROOM], self.now)
 
     def test_generation_failure_is_not_retried_within_slot(self):
         scheduler = self.scheduler(Mock(complete_json=Mock(side_effect=LLMError("模拟失败"))))
-        self.due(scheduler)
-        scheduler.tick()
-        self.assertEqual(scheduler.client.complete_json.call_count, 1)
+        self.activity(scheduler)
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
         self.assertEqual(self.backend.sent, [])
 
     def test_connection_change_during_generation_cancels_send(self):
@@ -501,9 +725,9 @@ class HourlyTests(unittest.TestCase):
         def generate(*args, **kwargs):
             self.service.close()
             self.service.bind(replacement)
-            return {"topic": "旧连接话题", "text": "这句话不能发到新连接"}
+            return {"speak": True, "topic": "旧连接话题", "text": "这句话不能发到新连接"}
         scheduler = self.scheduler(Mock(complete_json=generate))
-        self.due(scheduler)
+        self.activity(scheduler)
         self.assertEqual(self.backend.sent, [])
         self.assertEqual(replacement.sent, [])
 
@@ -512,7 +736,156 @@ class HourlyTests(unittest.TestCase):
         entity = scheduler.knowledge.entity(ROOM, "吉他话题", pinned=True)
         with scheduler.knowledge._lock, scheduler.knowledge._db():
             scheduler.knowledge.put(ROOM, entity["id"], "练习", "群内玩笑", "每天都说从明天练吉他", tags=["吉他"])
-        self.due(scheduler)
-        payload = json.loads(scheduler.client.complete_json.call_args.args[1])
+        self.activity(scheduler)
+        payload = json.loads(scheduler.model.client.complete_json.call_args.args[1])
         self.assertEqual(payload["knowledge"][0]["kind"], "群内玩笑")
         self.assertIn("吉他", payload["knowledge"][0]["content"])
+
+    def test_schedule_uses_day_and_evening_windows_and_silent_night(self):
+        scheduler = self.scheduler()
+        day = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)      # 北京11:00。
+        evening = datetime(2026, 10, 10, 11, 0, tzinfo=timezone.utc)  # 北京19:00。
+        night = datetime(2026, 10, 10, 15, 0, tzinfo=timezone.utc)    # 北京23:00。
+        scheduler.random = Mock(uniform=Mock(return_value=150))
+        self.assertEqual(scheduler._schedule(ROOM, day), day + timedelta(minutes=150))
+        scheduler.random.uniform.reset_mock()
+        scheduler._schedule(ROOM, evening)
+        self.assertEqual(scheduler.random.uniform.call_args.args, (180, 300))
+        next_day = scheduler._schedule(ROOM, night)
+        self.assertEqual(next_day.astimezone(daily.timezone(timedelta(hours=8))).hour, 9)
+
+    def test_end_hour_24_schedules_inside_next_window(self):
+        scheduler = self.scheduler(start_hour=9, end_hour=24,
+                                   random_source=Mock(uniform=Mock(side_effect=lambda low, high: high)))
+        at = datetime(2026, 10, 10, 15, 30, tzinfo=timezone.utc)  # 北京23:30。
+        due = scheduler._schedule(ROOM, at).astimezone(daily.timezone(timedelta(hours=8)))
+        self.assertEqual((due.hour, due.minute), (14, 0))
+        self.assertEqual(due.date(), (at.astimezone(daily.timezone(timedelta(hours=8))) + timedelta(days=1)).date())
+
+    def test_end_hour_24_window_ends_at_midnight(self):
+        scheduler = self.scheduler(start_hour=9, end_hour=24)
+        late = datetime(2026, 10, 10, 15, 30, tzinfo=timezone.utc)    # 北京23:30。
+        midnight = datetime(2026, 10, 10, 16, 30, tzinfo=timezone.utc)  # 次日00:30。
+        self.assertTrue(scheduler._in_window(late))
+        self.assertFalse(scheduler._in_window(midnight))
+
+    def test_narrow_evening_window_never_schedules_outside(self):
+        scheduler = self.scheduler(start_hour=22, end_hour=23,
+                                   random_source=Mock(uniform=Mock(side_effect=lambda low, high: high)))
+        at = datetime(2026, 10, 10, 14, 10, tzinfo=timezone.utc)  # 北京22:10。
+        due = scheduler._schedule(ROOM, at).astimezone(daily.timezone(timedelta(hours=8)))
+        self.assertEqual((due.hour, due.minute), (22, 59))
+
+    def test_daily_quota_and_cooldown_filter_before_model_call(self):
+        scheduler = self.scheduler(daily_limit=1)
+        start = self.now.astimezone(daily.timezone(timedelta(hours=8))).replace(
+            hour=1, minute=0, second=0, microsecond=0)
+        with scheduler.knowledge._lock, scheduler.knowledge._db() as db:
+            db.execute("""INSERT INTO proactive_candidates
+                (account,room,run_id,due_at,status,anchor_id,context_generation,
+                 created_at,updated_at,sent_at)
+                VALUES(?,?,?,?,'sent',0,0,'','',?)""",
+                (ROBOT, ROOM, "old-sent", start.isoformat(), start.isoformat()))
+        self.activity(scheduler)
+        scheduler.model.client.complete_json.assert_not_called()
+        self.assertEqual(self.backend.sent, [])
+        candidate = scheduler.knowledge._db().execute("""SELECT status,error FROM proactive_candidates
+            WHERE account=? AND room=? ORDER BY id DESC LIMIT 1""", (ROBOT, ROOM)).fetchone()
+        self.assertEqual(tuple(candidate), ("filtered", "daily-limit"))
+
+    def test_cooldown_blocks_model_but_filtered_and_failed_attempts_do_not(self):
+        scheduler = self.scheduler(daily_limit=6, cooldown_minutes=45)
+        with scheduler.knowledge._lock, scheduler.knowledge._db() as db:
+            db.execute("""INSERT INTO proactive_candidates
+                (account,room,run_id,due_at,status,anchor_id,context_generation,
+                 created_at,updated_at,sent_at)
+                VALUES(?,?,?,?,'unknown',0,0,?,?,?)""",
+                (ROBOT, ROOM, "recent", self.now.isoformat(),
+                 self.now.isoformat(), self.now.isoformat(), self.now.isoformat()))
+        self.activity(scheduler)
+        scheduler.model.client.complete_json.assert_not_called()
+        candidate = scheduler.knowledge._db().execute("""SELECT status,error FROM proactive_candidates
+            WHERE account=? AND room=? ORDER BY id DESC LIMIT 1""", (ROBOT, ROOM)).fetchone()
+        self.assertEqual(tuple(candidate), ("filtered", "cooldown"))
+
+        with scheduler.knowledge._lock, scheduler.knowledge._db() as db:
+            db.execute("UPDATE proactive_candidates SET status='failed' WHERE run_id='recent'")
+        self.now += timedelta(minutes=1)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
+        self.assertEqual(self.candidate_statuses(scheduler)[-1], "sent")
+
+    def test_daily_limit_resets_at_beijing_midnight(self):
+        scheduler = self.scheduler(daily_limit=1)
+        previous = datetime(2026, 10, 10, 15, 30, tzinfo=timezone.utc)  # 北京23:30。
+        with scheduler.knowledge._lock, scheduler.knowledge._db() as db:
+            db.execute("""INSERT INTO proactive_candidates
+                (account,room,run_id,due_at,status,anchor_id,context_generation,
+                 created_at,updated_at,sent_at)
+                VALUES(?,?,?,?,'sent',0,0,?,?,?)""",
+                (ROBOT, ROOM, "previous-day", previous.isoformat(),
+                 previous.isoformat(), previous.isoformat(), previous.isoformat()))
+        self.now = datetime(2026, 10, 10, 16, 30, tzinfo=timezone.utc)  # 北京次日00:30。
+        self.assertEqual(scheduler._usage(ROOM, self.now), (0, True))
+        scheduler.model.client.complete_json.assert_not_called()
+
+        self.now = datetime(2026, 10, 11, 2, 0, tzinfo=timezone.utc)  # 北京时间10:00。
+        self.record("新一天第一条", sender=CAT)
+        self.record("新一天第二条", sender=OTHER)
+        self.now += timedelta(minutes=1)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
+        self.assertEqual(scheduler.model.client.complete_json.call_count, 1)
+        self.assertEqual(self.candidate_statuses(scheduler)[-1], "sent")
+
+    def test_insufficient_activity_skips_model_and_records_details(self):
+        scheduler = self.scheduler(min_messages=2, min_speakers=2)
+        self.record("只有一个人说两句", sender=CAT)
+        self.record("还是同一个人", sender=CAT)
+        self.now += timedelta(minutes=1)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
+        scheduler.model.client.complete_json.assert_not_called()
+        candidate = scheduler.knowledge._db().execute("""SELECT status,activity_count,speaker_count,error
+            FROM proactive_candidates WHERE account=? AND room=? ORDER BY id DESC LIMIT 1""",
+            (ROBOT, ROOM)).fetchone()
+        self.assertEqual(tuple(candidate), ("filtered", 2, 1, "insufficient-activity"))
+
+    def test_model_result_requires_boolean_speak_and_text_fields(self):
+        for result in ({"topic": "旧格式", "text": "没有 speak 字段"},
+                       {"speak": "yes", "topic": "错误布尔值", "text": "不应发送"},
+                       {"speak": True, "topic": "缺正文"}):
+            self.backend = daily.Backend()
+            self.service.close()
+            self.service.bind(self.backend)
+            self.now = datetime(2026, 10, 10, 2, 0, tzinfo=timezone.utc)
+            scheduler = self.scheduler(Mock(complete_json=Mock(return_value=result)),
+                                       run_id="bad-" + str(len(result)))
+            self.record("最近在练吉他", sender=CAT)
+            self.record("我想学一首新曲子", sender=OTHER)
+            self.now += timedelta(minutes=1)
+            scheduler.next_candidate[ROOM] = self.now
+            scheduler.tick()
+            self.assertEqual(self.backend.sent, [])
+            self.assertEqual(self.candidate_statuses(scheduler)[-1], "failed")
+
+    def test_unconfirmed_send_counts_toward_quota_and_cooldown(self):
+        class UnconfirmedBackend(daily.Backend):
+            def send_text(self, room, text):
+                self.sent.append((room, text))
+                return False
+
+        self.service.close()
+        self.backend = UnconfirmedBackend()
+        self.service.bind(self.backend)
+        scheduler = self.scheduler(daily_limit=1)
+        self.record("最近在练吉他", sender=CAT)
+        self.record("我想学一首新曲子", sender=OTHER)
+        self.now += timedelta(minutes=1)
+        scheduler.next_candidate[ROOM] = self.now
+        scheduler.tick()
+        self.assertEqual(self.candidate_statuses(scheduler), ["unknown"])
+        self.assertEqual(len(self.backend.sent), 1)
+        count, cooldown = scheduler._usage(ROOM, self.now)
+        self.assertEqual((count, cooldown), (1, False))

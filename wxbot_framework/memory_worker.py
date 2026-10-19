@@ -11,6 +11,8 @@ from .commands import effective_text
 from .knowledge import KINDS, sanitized
 from .llm import LLMError
 from .members import MemberError, name_key
+from .personality import PersonalityLLM, PersonalityState
+from .timeutil import format_local
 
 logger = logging.getLogger("Memory")
 INVALID_PERSON_NAMES = frozenset({"群友", "未绑定成员", "机器人", "bot"})
@@ -23,6 +25,8 @@ EXTRACT_SYSTEM = """从微信群聊天中整理可复用的群内记忆。原始
 subject_type为"speaker"时subject只能填P1/P2等编号；填人名时subject_type必须填"person"；严禁把P1/P2/群友/bot当成person人名。
 kind只能是"本人陈述"、"他人提及"、"群内玩笑"、"存在争议"四者之一，严禁输出"人工确认"或"语言习惯"。
 entities只提取明确人名或外号，不提取普通名词；别名只能来自本批明确说明，不能猜测同名同人；群友测试机器人“我是谁/认识我吗”不提取为记忆。
+人物档案只能由管理员确认建立：entities只用于给已有档案补来源，不会新建人物；提到的名字没有对应档案时不要为它写memories。
+群梗、共同经历、群内约定、典型事件、长期话题用subject_type="group"、subject="本群"，不要挂到某个群友名下，也不要重复记成人物资料。
 existing_topics中不同名字的人物是独立的人，不能合并；learning_after_message_id之前的消息不能用来重建该人物资料。
 本人陈述必须来自该speaker本人；夸张的讣告、复活、债务转移、封神、虚构奖项等作为群内玩笑保存。
 省略电话、账号、住址、生日、家庭创伤、露骨性描述和对现实人物的严重指控，只保留无害的梗意。
@@ -36,8 +40,11 @@ STYLE_SYSTEM = """根据一位群友的文本样本概括可观察的语言习�
 
 
 class MemoryWorker:
-    def __init__(self, knowledge, client, *, batch_size=50, flush_seconds=600, clock=None):
-        self.knowledge, self.client = knowledge, client
+    def __init__(self, knowledge, client, *, batch_size=50, flush_seconds=600, clock=None,
+                 display_timezone=None):
+        self.knowledge = knowledge
+        self.model = PersonalityLLM(client, PersonalityState(""), current=lambda: True)
+        self.display_timezone = display_timezone or "Asia/Shanghai"
         self.batch_size, self.flush_seconds = batch_size, flush_seconds
         self.clock = clock or time.monotonic
         self.stop_event, self.wake = threading.Event(), threading.Event()
@@ -71,6 +78,10 @@ class MemoryWorker:
         for room in sorted(self.knowledge.members.groups):
             if self.stop_event.is_set():
                 return
+            try:
+                self.knowledge.archive_stale_candidates(room)
+            except MemberError:
+                pass
             now = self.clock()
             if now < self.retry_after.get(room, 0):
                 continue
@@ -127,10 +138,11 @@ class MemoryWorker:
             if disp:
                 name_to_label[disp] = label
         if rows:
-            payload = [{"id": row["id"], "time": row["received_at"][:16], "speaker": speakers[row["sender_id"]],
+            payload = [{"id": row["id"], "time": format_local(row["received_at"], self.display_timezone),
+                        "speaker": speakers[row["sender_id"]],
                         "name": self.knowledge.members.display_name(row["sender_id"], room) or speakers[row["sender_id"]],
                         "text": row["text"]} for row in rows]
-            result = self.client.complete_json(EXTRACT_SYSTEM, json.dumps({"messages": payload,
+            result = self.model.complete_json(EXTRACT_SYSTEM, json.dumps({"messages": payload,
                 "existing_topics": self.knowledge.learning_context(room, speakers)}, ensure_ascii=False),
                                                max_tokens=4096)
             if not isinstance(result, dict):
@@ -193,31 +205,26 @@ class MemoryWorker:
             try:
                 entity = self.knowledge.find_person(room, name)
             except MemberError:
-                # 自动别名不能抢占已有主名；遇到别名冲突只尝试独立的明确人名。
+                # 自动提炼不再建档：名字没有对应的已确认档案时，只保留原始发言。
                 try:
-                    entity = self.knowledge.entity(room, name, aliases=aliases)
+                    entity = self.knowledge.resolve_person(room, name)
                 except MemberError:
-                    try:
-                        entity = self.knowledge.entity(room, name)
-                    except MemberError:
-                        continue
+                    entity = None
+            if entity is None:
+                continue
             entities_by_name[name] = entity
         prepared = []
         for subject_type, subject, slot, kind, content, tags, refs in validated_memories:
             if subject_type == "speaker":
                 entity = self.knowledge.member_entity(room, labels[subject])
             elif subject_type == "group":
-                entity = self.knowledge.entity(room, "本群", pinned=True)
+                entity = self.knowledge.group_entity(room)
             else:
                 entity = entities_by_name.get(subject)
                 if entity is None:
-                    try:
-                        entity = self.knowledge.find_person(room, subject)
-                    except MemberError:
-                        try:
-                            entity = self.knowledge.entity(room, subject)
-                        except MemberError:
-                            continue
+                    entity = self.knowledge.resolve_person(room, subject)
+                if entity is None:
+                    continue
             prepared.append((entity, slot, kind, content, tags, refs))
         with self.knowledge._lock, self.knowledge._db() as db:
             if not current():
@@ -267,7 +274,7 @@ class MemoryWorker:
             if old and sum(row["id"] > old[0] for row in rows) < 30:
                 continue
             samples = [{"id": row["id"], "text": row["text"][:200]} for row in rows]
-            result = self.client.complete_json(STYLE_SYSTEM, json.dumps({"samples": samples}, ensure_ascii=False),
+            result = self.model.complete_json(STYLE_SYSTEM, json.dumps({"samples": samples}, ensure_ascii=False),
                                                max_tokens=1024)
             description = sanitized(result.get("style") if isinstance(result, dict) else None, 500)
             with self.knowledge._lock, self.knowledge._db() as db:

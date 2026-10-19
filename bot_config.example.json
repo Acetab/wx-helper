@@ -3,6 +3,7 @@
   "chat_allowlist": [],
   "wechat_pid": null,
   "wechat_account": "wxid_example_robot",
+  "display_timezone": "Asia/Shanghai",
   "reconnect_seconds": 5,
   "plugin_queue_size": 128,
   "console": true,
@@ -12,7 +13,7 @@
   "maintenance": {
     "default_room": null,
     "upgrade_file": null,
-    "announcement": null
+    "announcements": []
   },
   "memory": {
     "enabled": false,
@@ -24,6 +25,17 @@
     "enabled": false,
     "start_hour": 9,
     "end_hour": 23,
+    "evening_start_hour": 18,
+    "active_min_minutes": 120,
+    "active_max_minutes": 180,
+    "evening_min_minutes": 180,
+    "evening_max_minutes": 300,
+    "activity_window_minutes": 180,
+    "daily_limit": 6,
+    "cooldown_minutes": 45,
+    "stale_candidate_minutes": 15,
+    "min_messages": 2,
+    "min_speakers": 2,
     "context_limit": 200
   },
   "text_send_delay": {

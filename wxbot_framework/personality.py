@@ -47,6 +47,14 @@ class PersonalityLLM:
             raise PersonalityExpired("当前回复已失效")
         return result
 
+    def complete_text(self, system, user, **options):
+        if not self.current():
+            raise PersonalityExpired("当前回复已失效")
+        result = self.client.complete_text(system_with_personality(system, self.state), user, **options)
+        if not self.current():
+            raise PersonalityExpired("当前回复已失效")
+        return result
+
 
 def prepare_switch(message, store):
     if (store is None or message.type != 1 or not message.is_group or message.chat_id not in store.groups or

@@ -1,5 +1,6 @@
 {
   "api": "v1",
+  "author": "Inmata",
   "description": "人物档案、记忆查询、维护者纠错与群指令帮助",
   "requires": ["group.text.receive", "group.text.send"]
 }

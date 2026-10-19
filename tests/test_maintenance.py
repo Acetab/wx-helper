@@ -9,12 +9,14 @@ from wxbot_framework.authorization import LOCAL_EDITOR
 from wxbot_framework.config import ConfigStore
 from wxbot_framework.knowledge import KnowledgeStore
 from wxbot_framework.locking import InstanceLock
-from wxbot_framework.maintenance import MaintenanceRouter, MaintenanceService
+from wxbot_framework.maintenance import MaintenanceRouter, MaintenanceService, maintenance_options
 from wxbot_framework.members import MemberError, MemberStore
 from wxbot_framework.memory_worker import MemoryWorker
 from wxbot_framework.runtime import BotApplication
 from wxbot_framework.sdk import Message
-from wxbot_framework.upgrades import StartupNotice, apply_upgrade
+from wxbot_framework.upgrades import (
+    AnnouncementQueue, StartupNotice, announcement_contributions, apply_upgrade,
+)
 
 ROOM, OTHER_ROOM, OWNER, OTHER, ROBOT = daily.ROOM, daily.OTHER_ROOM, daily.CAT, daily.OTHER, daily.ROBOT
 
@@ -267,6 +269,94 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(notice.status(), "sent")
         self.assertEqual(len(self.backend.sent), 1)
 
+    def test_announcement_queue_appends_contributors_in_declared_order(self):
+        k = self.kb()
+        notices = [
+            {"id": "first", "room": ROOM, "text": "第一项", "plugins": ["zeta", "alpha"]},
+            {"id": "second", "room": OTHER_ROOM, "text": "第二项", "plugins": []},
+        ]
+        queue = AnnouncementQueue(
+            k, self.service, notices, run_id="announcement-run",
+            contributors=[
+                {"plugin": "alpha", "author": "作者甲", "pull_request_author": "提交乙",
+                 "contributors": ["贡献丙", "贡献丁"]},
+                {"plugin": "zeta", "author": "作者戊", "pull_request_author": "提交己",
+                 "contributors": ["贡献庚"]},
+            ])
+        self.assertTrue(queue.send())
+        self.assertEqual([item[0] for item in self.backend.sent], [ROOM, OTHER_ROOM])
+        first = self.backend.sent[0][1]
+        self.assertLess(first.index("zeta："), first.index("alpha："))
+        self.assertIn("提交乙", first)
+        self.assertIn("贡献丙、贡献丁", first)
+        self.assertFalse(queue.send())
+        self.assertEqual([state["status"] for state in queue.all_status()], ["sent", "sent"])
+
+    def test_announcement_contributors_fallback_without_mutating_request_order(self):
+        lines = announcement_contributions(
+            ["unknown", "zeta"],
+            [{"plugin": "zeta", "author": "作者", "pull_request_author": "提交者",
+              "contributors": ["贡献者"]}])
+        self.assertTrue(lines.startswith("unknown：作者 Inmata；PR 提交者 Inmata"))
+        self.assertTrue(lines.endswith("zeta：作者 作者；PR 提交者 提交者；实际贡献者 贡献者"))
+
+    def test_announcement_queue_continues_after_unknown_and_keeps_attempt_history(self):
+        k = self.kb()
+        notices = [
+            {"id": "uncertain", "room": ROOM, "text": "第一项", "plugins": []},
+            {"id": "next", "room": ROOM, "text": "第二项", "plugins": []},
+        ]
+        facade = Mock(session_id="test", send_text=Mock(side_effect=[False, True, True]))
+        queue = AnnouncementQueue(k, facade, notices, run_id="same-run")
+        self.assertTrue(queue.send())
+        self.assertEqual(facade.send_text.call_count, 2)
+        self.assertEqual([state["status"] for state in queue.all_status()], ["unknown", "sent"])
+        self.assertFalse(queue.send())
+        self.assertEqual(facade.send_text.call_count, 2)
+        self.assertTrue(queue.resend("uncertain"))
+        self.assertEqual(facade.send_text.call_count, 3)
+        attempts = k._db().execute("""SELECT status FROM startup_notice_attempts
+            WHERE account=? AND room=? AND notice_id='uncertain' ORDER BY id""",
+            (ROBOT, ROOM)).fetchall()
+        self.assertEqual([row[0] for row in attempts], ["unknown", "sent"])
+
+    def test_announcement_resend_requires_id_when_multiple_notices_configured(self):
+        notices = [
+            {"id": "one", "room": ROOM, "text": "一", "plugins": []},
+            {"id": "two", "room": ROOM, "text": "二", "plugins": []},
+        ]
+        queue = AnnouncementQueue(self.kb(), self.service, notices)
+        with self.assertRaisesRegex(ValueError, "必须指定公告 ID"):
+            queue.resend()
+        self.assertEqual(self.backend.sent, [])
+
+    def test_announcement_length_validation_uses_actual_rendered_text(self):
+        contributors = [{"plugin": "alpha", "author": "作者", "pull_request_author": "提交者",
+                         "contributors": ["贡献者"]}]
+        notice = {"id": "limit", "room": ROOM, "text": "正" * 280, "plugins": ["alpha"]}
+        config = {"maintenance": {"announcements": [notice]}}
+        with self.assertRaisesRegex(ValueError, "含插件贡献后超过 900"):
+            maintenance_options(config, contributors=contributors)
+
+    def test_announcement_options_reject_legacy_conflict_duplicate_id_and_double_bytes(self):
+        base = {"id": "same", "room": ROOM, "text": "公告", "plugins": []}
+        with self.assertRaisesRegex(ValueError, "不能同时配置"):
+            maintenance_options({"maintenance": {"announcement": base, "announcements": [base]}})
+        with self.assertRaisesRegex(ValueError, "ID 不正确/重复"):
+            maintenance_options({"maintenance": {"announcements": [base, {**base, "room": OTHER_ROOM}]}})
+        with self.assertRaisesRegex(ValueError, "900 个 UTF-8 字节"):
+            maintenance_options({"maintenance": {"announcements": [{**base, "text": "正" * 301}]}})
+
+    def test_announcement_queue_waits_while_offline_without_history(self):
+        k = self.kb()
+        offline = Mock(session_id=None)
+        notice = {"id": "waiting", "room": ROOM, "text": "等待连接", "plugins": []}
+        queue = AnnouncementQueue(k, offline, [notice], run_id="waiting-run")
+        self.assertFalse(queue.send())
+        self.assertEqual(queue.status("waiting")["status"], "waiting")
+        attempts = k._db().execute("SELECT COUNT(*) FROM startup_notice_attempts").fetchone()[0]
+        self.assertEqual(attempts, 0)
+
     def test_profile_upgrade_splits_people_and_preserves_item_ids_and_sources(self):
         k = self.kb()
         old = k.entity(ROOM, "示例甲", aliases=["示例乙", "示例丙", "待确认外号"], pinned=True)
@@ -294,7 +384,17 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_v1_schema_migration_keeps_item_number_and_source(self):
         # 真实旧结构没有 epoch；该编号已被使用者记住，升级后必须仍能查询。
-        db = self.store._connection()
+        config_path = self.root / "v1-members.json"
+        config_path.write_text(json.dumps({
+            "database_file": "v1.sqlite3",
+            "history_enabled": True,
+            "daily_clear": False,
+            "owner_wxid": OWNER,
+            "groups": {ROOM: []},
+        }), encoding="utf-8")
+        legacy_members = MemberStore(config_path, ROBOT, now=lambda: self.now)
+        self.stores.append(legacy_members)
+        db = legacy_members._connection()
         db.executescript("""
             CREATE TABLE knowledge_entities(id INTEGER PRIMARY KEY,account TEXT NOT NULL,room TEXT NOT NULL,
                 entity_key TEXT NOT NULL,name TEXT NOT NULL,aliases TEXT NOT NULL DEFAULT '[]',wxid TEXT,
@@ -310,11 +410,12 @@ class MaintenanceTests(unittest.TestCase):
             db.execute("INSERT INTO knowledge_entities VALUES(7,?,?,'person:示例','示例','[]',NULL,1)", (ROBOT, ROOM))
             db.execute("INSERT INTO knowledge_items VALUES(42,?,?,7,'爱好','他人提及','喜欢吉他','[]','active',0,2,'2026-01-01')", (ROBOT, ROOM))
             db.execute("INSERT INTO knowledge_sources VALUES(42,'seed:test',NULL,NULL,'2026-01-01')")
-        k = self.kb()
+        k = KnowledgeStore(legacy_members)
+        k.initialize()
         self.assertEqual(k.admin_item(ROOM, 42)["epoch"], 0)
         self.assertEqual(k.admin_item(ROOM, 42)["revision"], 2)
         self.assertEqual(k.search(ROOM, "示例")[0]["sources"][0]["origin"], "seed:test")
-        self.assertTrue(list((self.root / "backups").glob("*-before-maintenance-*.sqlite3")))
+        self.assertEqual(len(list((self.root / "backups").glob("*-before-maintenance-*.sqlite3"))), 1)
         k.initialize()
         self.assertEqual(len(list((self.root / "backups").glob("*-before-maintenance-*.sqlite3"))), 1)
 
@@ -395,6 +496,66 @@ class MaintenanceTests(unittest.TestCase):
         router.process(Message("/解绑 示例人物乙", OWNER, sender_id=OWNER, session_id="test"))
         self.assertIsNone(k.find_person(ROOM, "示例人物乙")["wxid"])
         self.assertIsNone(self.store.find_by_wxid(OTHER, ROOM))
+
+    def test_status_reply_is_grouped_chinese_without_raw_dump(self):
+        k = self.kb()
+        app = Mock(
+            _connection_ready=True,
+            config={"display_timezone": "Asia/Shanghai"},
+            memory_options={"enabled": True, "batch_size": 50, "flush_seconds": 600},
+            hourly_options={
+                "enabled": True,
+                "start_hour": 9,
+                "end_hour": 23,
+                "active_min_minutes": 120,
+                "active_max_minutes": 180,
+                "evening_min_minutes": 180,
+                "evening_max_minutes": 300,
+                "activity_window_minutes": 180,
+                "daily_limit": 6,
+                "cooldown_minutes": 45,
+                "min_messages": 2,
+                "min_speakers": 2,
+                "context_limit": 200,
+            })
+        service = MaintenanceService(k, app=app, options={"default_room": ROOM})
+        text = service.execute("状态", LOCAL_EDITOR, current_room=ROOM)
+        self.assertIn(ROOM, text)
+        self.assertIn("长期记忆", text)
+        self.assertIn("主动发言：已开启", text)
+        self.assertIn("静默", text)
+        self.assertIn("日上限 6 次", text)
+        self.assertIn("冷却 45 分钟", text)
+        self.assertNotIn("{", text)
+
+    def test_person_quarantine_restore_and_merge_keep_memories(self):
+        k = self.kb()
+        service = MaintenanceService(k, options={"default_room": ROOM})
+        wrong = k.entity(ROOM, "误建人物", pinned=True)
+        keep = k.entity(ROOM, "保留人物", aliases=["老名"], pinned=True)
+        item = k.add_memory(ROOM, wrong["id"], "爱好", "人工确认", "喜欢吉他", OWNER)
+        out = service.execute("人物 隔离 误建人物", LOCAL_EDITOR, current_room=ROOM)
+        self.assertIn("已隔离", out)
+        self.assertIsNone(k.resolve_person(ROOM, "误建人物"))
+        self.assertEqual(k.search(ROOM, "吉他"), [])
+        self.assertEqual(k.admin_item(ROOM, item)["content"], "喜欢吉他")
+        self.assertIn("待补绑", service.execute("人物 列表", LOCAL_EDITOR, current_room=ROOM))
+        self.assertIn("已恢复", service.execute(f"人物 恢复 #{wrong['id']}", LOCAL_EDITOR, current_room=ROOM))
+        merged, moved = k.merge_person(ROOM, "误建人物", "保留人物", LOCAL_EDITOR)
+        self.assertEqual(merged["name"], "保留人物")
+        self.assertEqual(moved, 1)
+        self.assertEqual(k.admin_item(ROOM, item)["entity_id"], merged["id"])
+        self.assertIn("误建人物", json.loads(merged["aliases"]))
+        self.assertEqual(k.find_person(ROOM, "误建人物")["id"], merged["id"])
+        self.assertEqual(k.search(ROOM, "吉他")[0]["name"], "保留人物")
+
+    def test_group_memory_is_listed_separately_from_people(self):
+        k = self.kb()
+        service = MaintenanceService(k, options={"default_room": ROOM})
+        k.group_entity(ROOM)
+        listing = service.execute("人物 列表", LOCAL_EDITOR, current_room=ROOM)
+        self.assertNotIn("本群", listing)
+        self.assertIn("本群", service.execute("人物 查看 本群", LOCAL_EDITOR, current_room=ROOM))
 
 
 if __name__ == "__main__":

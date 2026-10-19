@@ -29,9 +29,11 @@ class BotApplication:
     def __init__(self, root, store, *, backend_factory=None):
         self.root, self.store = root, store
         self.config = store.load()
+        self.display_timezone = self.config.get("display_timezone", "Asia/Shanghai")
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"))
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
-        self.knowledge = KnowledgeStore(self.members) if self.members is not None else None
+        self.knowledge = (KnowledgeStore(self.members, display_timezone=self.display_timezone)
+                          if self.members is not None else None)
         self.room_state = RoomStateStore(self.members) if self.members is not None else None
         self.memory_options, self.hourly_options = feature_options(self.config)
         self.memory_worker = self.hourly_scheduler = None
@@ -46,6 +48,11 @@ class BotApplication:
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
                                      self.config.get("plugin_queue_size", 128), member_store=self.members,
                                      knowledge_store=self.knowledge, room_state_store=self.room_state)
+        # 插件发现后复用与发送相同的署名快照校验公告长度。
+        self.contributors = self.plugins.contributions()
+        self.maintenance_options = maintenance_options(self.config, contributors=self.contributors)
+        if self.maintenance is not None:
+            self.maintenance.options = self.maintenance_options
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -79,7 +86,7 @@ class BotApplication:
             self._log_connection_error(error)
             self._disconnect()
         if self._connection_ready and self.startup_notice:
-            # 公告失败不影响微信连接；已确认发送的版本不重复，未确认的下次启动重试。
+            # 公告失败不影响微信连接；本次运行只继续尚未成功的公告。
             self.startup_notice.send()
 
     def sync_wechat_directory(self, room=None):
@@ -208,13 +215,16 @@ class BotApplication:
         if self.memory_options["enabled"] and not self.memory_worker:
             from .memory_worker import MemoryWorker
             self.memory_worker = MemoryWorker(self.knowledge, client, batch_size=self.memory_options["batch_size"],
-                                              flush_seconds=self.memory_options["flush_seconds"])
+                                              flush_seconds=self.memory_options["flush_seconds"],
+                                              display_timezone=self.display_timezone)
             self.memory_worker.start()
         if self.hourly_options["enabled"] and not self.hourly_scheduler:
             from .hourly import HourlyScheduler
-            self.hourly_scheduler = HourlyScheduler(self.knowledge, self.service, client,
-                start_hour=self.hourly_options["start_hour"], end_hour=self.hourly_options["end_hour"],
-                context_limit=self.hourly_options["context_limit"], allowlist=self.config.get("chat_allowlist", []),
+            options = {key: value for key, value in self.hourly_options.items() if key != "enabled"}
+            self.hourly_scheduler = HourlyScheduler(
+                self.knowledge, self.service, client, **options,
+                allowlist=self.config.get("chat_allowlist", []),
+                stale_minutes=lambda: self.hourly_options["stale_candidate_minutes"],
                 ready=lambda: self._connection_ready)
             self.hourly_scheduler.start()
 
@@ -226,6 +236,7 @@ class BotApplication:
             candidate[section] = {**candidate.get(section, {}), **changes}
             self.store.validate(candidate)
             memory, hourly = feature_options(candidate)
+            display_timezone = candidate.get("display_timezone", "Asia/Shanghai")
             if memory["enabled"] or hourly["enabled"]:
                 if not self.members or not self.members.history_enabled or self.members.daily_clear:
                     raise ValueError("后台功能需要持久化的群聊记录")
@@ -238,6 +249,10 @@ class BotApplication:
                 self.hourly_scheduler.close()
                 self.hourly_scheduler = None
             self.config = self.store.update_section(section, changes)
+            if self.knowledge:
+                self.display_timezone = display_timezone
+                self.knowledge.display_timezone = self.display_timezone
+                self.maintenance.display_timezone = self.display_timezone
             self.memory_options, self.hourly_options = feature_options(self.config)
             self._start_background()
 
@@ -253,15 +268,18 @@ class BotApplication:
                                           upgrade_file=self.store.path.parent / upgrade if upgrade else None)
                 if self.room_state is not None:
                     self.room_state.initialize()
-                if self.maintenance_options["announcement"]:
-                    from .upgrades import StartupNotice
-                    notice = self.maintenance_options["announcement"]
-                    self.knowledge._room(notice["room"])
-                    if self.config.get("chat_allowlist") and notice["room"] not in self.config["chat_allowlist"]:
-                        raise ValueError("更新公告群不在当前收发范围内")
-                    self.startup_notice = StartupNotice(self.knowledge, self.service, notice)
-                    logger.info("启动公告就绪：%s -> %s（当前状态：%s）", self.startup_notice.notice_id,
-                                notice["room"], self.startup_notice.status())
+                notices = self.maintenance_options["announcements"]
+                if notices:
+                    from .upgrades import AnnouncementQueue
+                    for notice in notices:
+                        self.knowledge._room(notice["room"])
+                        if self.config.get("chat_allowlist") and notice["room"] not in self.config["chat_allowlist"]:
+                            raise ValueError("启动公告群不在当前收发范围内")
+                    self.startup_notice = AnnouncementQueue(
+                        self.knowledge, self.service, notices, contributors=self.contributors)
+                    for notice, state in zip(notices, self.startup_notice.all_status()):
+                        logger.info("启动公告就绪：%s -> %s（当前状态：%s）",
+                                    notice["id"], notice["room"], state["status"])
             self._start_background()
             self.plugins.reload()
             if self.maintenance_router:
@@ -312,7 +330,7 @@ class BotApplication:
             logger.info("正在退出：先停止微信接收并清理桥接，再等待后台任务结束")
             cleaned = self._disconnect()
             failures = []
-            for name, attribute in (("维护", "maintenance_router"), ("定时", "hourly_scheduler"), ("记忆", "memory_worker")):
+            for name, attribute in (("维护", "maintenance_router"), ("主动群聊", "hourly_scheduler"), ("记忆", "memory_worker")):
                 worker = getattr(self, attribute)
                 if worker:
                     try:

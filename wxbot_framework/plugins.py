@@ -26,6 +26,9 @@ class PluginSpec:
     api: str
     description: str
     requires: frozenset
+    author: str = ""
+    pull_request_author: str = ""
+    contributors: tuple = ()
 
 
 class PluginRecord:
@@ -144,11 +147,40 @@ class PluginManager:
                 requires = manifest.get("requires", ["text.receive"])
                 if api not in ("v1", "legacy") or not isinstance(requires, list) or not all(isinstance(x, str) for x in requires):
                     raise ValueError("plugin.json 的 api / requires 不合法")
-                specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")), frozenset(requires))
+                author = manifest.get("author", "")
+                pr_author = manifest.get("pull_request_author", "")
+                contributors = manifest.get("contributors", [])
+                if (not isinstance(author, str) or not isinstance(pr_author, str) or
+                        not isinstance(contributors, list) or
+                        not all(isinstance(item, str) for item in contributors)):
+                    raise ValueError("plugin.json 的作者字段应为字符串或字符串列表")
+                specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")),
+                                         frozenset(requires), author.strip(),
+                                         pr_author.strip(), tuple(item.strip() for item in contributors))
             except Exception as error:
                 self.load_errors[directory.name] = str(error)
                 logger.error("插件 %s 无法发现：%s", directory.name, error)
         return specs
+
+    def contributions(self):
+        """按发现顺序确定插件贡献；缺失的署名回退仓库默认维护者。"""
+        from .upgrades import CONTRIBUTOR_FALLBACK
+        rows = []
+        for spec in sorted(self.discover().values(), key=lambda item: item.name):
+            author = spec.author or CONTRIBUTOR_FALLBACK
+            pr_author = spec.pull_request_author or author
+            contributors = tuple(spec.contributors) or (author,)
+            rows.append({"plugin": spec.name, "author": author, "pull_request_author": pr_author,
+                         "contributors": contributors, "description": spec.description})
+        return rows
+
+    def contribution_rows(self, names=None):
+        """供公告使用；指定插件时严格保持声明顺序。"""
+        by_name = {row["plugin"]: row for row in self.contributions()}
+        if names is not None:
+            return [by_name.get(name, {"plugin": name}) for name in names]
+        order = list(dict.fromkeys([*names, *sorted(by_name)]))
+        return [by_name[name] for name in order if name in by_name]
 
     def _prepare(self, spec):
         missing = spec.requires - self.capabilities
@@ -158,7 +190,8 @@ class PluginManager:
         context = PluginContext(spec.name, options, self.service, self.capabilities,
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
                                 member_store=self.member_store, knowledge_store=self.knowledge_store,
-                                room_state_store=self.room_state_store)
+                                room_state_store=self.room_state_store,
+                                display_timezone=self.config.get("display_timezone", "Asia/Shanghai"))
         # 每次使用独立模块名并重新编译源文件，热重载不复用旧入口字节码。
         if "_wxbot_plugins" not in sys.modules:
             package = types.ModuleType("_wxbot_plugins")

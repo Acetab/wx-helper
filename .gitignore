@@ -10,6 +10,7 @@ private_markers.*
 # Runtime data, messages, logs and caches
 .runtime/
 logs/
+/backups/
 __pycache__/
 *.py[cod]
 *.sqlite*

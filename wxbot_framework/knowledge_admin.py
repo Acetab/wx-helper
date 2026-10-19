@@ -100,7 +100,7 @@ class KnowledgeAdminMixin:
             if name is not None:
                 name_key(name)
                 if not entity["entity_key"].startswith("person:"):
-                    raise MemberError("微信成员称呼请使用本人绑定或成员绑定命令修改")
+                    raise MemberError("微信成员称呼请使用管理员成员绑定命令修改")
                 aliases.add(name_key(entity["name"]))
                 entity.update(name=name.strip(), entity_key="person:" + name_key(name))
             if alias is not None:
@@ -256,3 +256,82 @@ class KnowledgeAdminMixin:
     def epoch_snapshot(self, room):
         with self._lock:
             return {e["id"]: e["epoch"] for e in self._entities(room)}
+
+    def pending_binding(self, room):
+        """仍然保留资料但尚未绑定微信身份的人物，供管理员补绑核对。"""
+        with self._lock:
+            return [e for e in self._entities(room)
+                    if e["entity_key"].startswith("person:") and e["status"] == "active" and not e["wxid"]]
+
+    def quarantine_person(self, room, value, editor):
+        """隔离误建/可疑人物：不再出现在列表、检索与模型上下文，资料和来源原样保留。"""
+        self.require_editor(editor)
+        with self._lock, self._db() as db:
+            entity = self.admin_entity(room, value)
+            if not entity["entity_key"].startswith("person:"):
+                raise MemberError("只能隔离人物档案")
+            before = dict(entity)
+            db.execute("UPDATE knowledge_entities SET status='quarantined' WHERE id=?", (entity["id"],))
+            entity["status"] = "quarantined"
+            self.entity_audit(room, entity["id"], editor, "quarantine", before, entity)
+            return entity
+
+    def restore_person(self, room, value, editor):
+        self.require_editor(editor)
+        with self._lock, self._db() as db:
+            token = str(value).lstrip("#")
+            row = db.execute("SELECT * FROM knowledge_entities WHERE account=? AND room=? AND id=?",
+                             (self.account, room, int(token))).fetchone() if token.isdigit() else None
+            if row is None:
+                try:
+                    entity = self.admin_entity(room, value)
+                except MemberError:
+                    entity = None
+                if entity is not None and entity["status"] != "quarantined":
+                    raise MemberError("该人物当前不是隔离状态")
+                if entity is None:
+                    raise MemberError("没有找到这个隔离人物，请用 #编号 恢复")
+                row = db.execute("SELECT * FROM knowledge_entities WHERE id=?", (entity["id"],)).fetchone()
+            if row is None or not row["entity_key"].startswith("person:"):
+                raise MemberError("只能恢复被隔离的人物档案")
+            before = dict(row)
+            db.execute("UPDATE knowledge_entities SET status='active' WHERE id=?", (row["id"],))
+            after = dict(db.execute("SELECT * FROM knowledge_entities WHERE id=?", (row["id"],)).fetchone())
+            self.entity_audit(room, row["id"], editor, "restore-person", before, after)
+            return after
+
+    def merge_person(self, room, source, target, editor):
+        """把同一个人重复建立的档案合并到保留档案，条目、来源与编号原样保留。"""
+        self.require_editor(editor)
+        with self._lock, self._db() as db:
+            left, right = self.admin_entity(room, source), self.admin_entity(room, target)
+            if left["id"] == right["id"]:
+                raise MemberError("源人物和目标人物是同一份档案")
+            if not left["entity_key"].startswith("person:") or not right["entity_key"].startswith("person:"):
+                raise MemberError("只能合并人物档案")
+            if right["wxid"] and left["wxid"] and left["wxid"] != right["wxid"]:
+                raise MemberError("两份档案绑定了不同微信身份，请先核对")
+            moved = 0
+            for item in db.execute("SELECT * FROM knowledge_items WHERE entity_id=?", (left["id"],)).fetchall():
+                conflict = db.execute("SELECT 1 FROM knowledge_items WHERE entity_id=? AND epoch=? AND slot=?",
+                                      (right["id"], right["epoch"], item["slot"])).fetchone()
+                slot = item["slot"] if not conflict else item["slot"][:60] + "#" + str(item["id"])
+                active_epoch = item["epoch"] == left["epoch"]
+                db.execute("UPDATE knowledge_items SET entity_id=?,slot=?,epoch=?,status=? WHERE id=?",
+                           (right["id"], slot, right["epoch"] if active_epoch else -item["id"],
+                            item["status"] if active_epoch else "archived", item["id"]))
+                moved += 1
+            db.execute("UPDATE OR IGNORE knowledge_mentions SET entity_id=? WHERE entity_id=?", (right["id"], left["id"]))
+            db.execute("DELETE FROM knowledge_mentions WHERE entity_id=?", (left["id"],))
+            db.execute("UPDATE OR REPLACE member_styles SET entity_id=? WHERE entity_id=?", (right["id"], left["id"]))
+            db.execute("DELETE FROM member_styles WHERE entity_id=?", (left["id"],))
+            aliases = sorted(set(parse_aliases(right["aliases"])) | set(parse_aliases(left["aliases"])) |
+                             {name_key(left["name"])} - {name_key(right["name"])})
+            wxid = right["wxid"] or left["wxid"]
+            db.execute("UPDATE knowledge_entities SET aliases=?,wxid=?,pinned=1 WHERE id=?",
+                       (json.dumps(aliases, ensure_ascii=False), wxid, right["id"]))
+            db.execute("DELETE FROM knowledge_entities WHERE id=?", (left["id"],))
+            merged = dict(db.execute("SELECT * FROM knowledge_entities WHERE id=?", (right["id"],)).fetchone())
+            self.sync_person_member(room, right["id"])
+            self.entity_audit(room, right["id"], editor, "merge-person", left, merged)
+            return merged, moved

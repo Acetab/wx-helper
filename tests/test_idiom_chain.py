@@ -40,6 +40,21 @@ class FakeRoomState:
         self.data.pop((room, feature), None)
 
 
+class FakeMembers:
+    """只提供接龙需要的水位查询，模拟持久记录与清空后的 ID 复用。"""
+
+    def __init__(self):
+        self.history_enabled = True
+        self.latest = 0
+        self.ids = {}
+
+    def latest_id(self, room):
+        return self.latest
+
+    def message_id(self, message):
+        return self.ids.get(message.text)
+
+
 class Context:
     def __init__(self):
         self.config = {"member_names": {ROOM: {A: "小明", B: "小红"}}}
@@ -67,17 +82,32 @@ class Context:
         return self.succeeds
 
 
+class NoMemberContext(Context):
+    """模拟未配置成员目录的 PluginContext：读取 members 会抛能力异常。"""
+
+    @property
+    def members(self):
+        from wxbot_framework.sdk import CapabilityError
+        raise CapabilityError("尚未配置框架成员目录")
+
+
 class IdiomPluginTests(unittest.TestCase):
     def setUp(self):
         self.ctx = Context()
         self.plugin = Plugin()
         self.plugin.on_load(self.ctx)
+        self.sequence = 0
 
     def send(self, text, sender=A, room=ROOM, *, session="one", received_at=None, is_self=False,
-             is_group=True, at_self=False):
+             is_group=True, at_self=False, sequence=None):
+        if sequence is None:
+            self.sequence += 1
+            sequence = self.sequence
+        else:
+            self.sequence = max(self.sequence, sequence)
         message = Message(text, room, sender_id=sender, session_id=session, is_group=is_group,
                           is_self=is_self, received_at=time.monotonic() if received_at is None else received_at,
-                          data={"is_at_self": at_self})
+                          sequence=sequence, data={"is_at_self": at_self})
         self.plugin.on_message(message, self.ctx)
         return message
 
@@ -139,14 +169,124 @@ class IdiomPluginTests(unittest.TestCase):
     def test_only_first_answer_of_a_round_counts(self):
         self.start()
         arrived = time.monotonic()
-        self.send("意气风发", A, received_at=arrived)
+        self.send("意气风发", A, received_at=arrived, sequence=2)
         count = len(self.ctx.sent)
-        self.send("大大方方", B, received_at=arrived + 0.00000001)
+        # 与第一条答案同一 sequence：模拟判定期间排队、发题后才被处理的消息。
+        self.send("大大方方", B, received_at=arrived + 0.00000001, sequence=2)
         self.assertEqual(len(self.ctx.sent), count)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
         self.ctx.llm.result["next_idiom"] = "方兴未艾"
         self.send("大大方方", B)
         self.assertEqual(self.plugin.games[ROOM].chain.current, "方兴未艾")
+
+    def test_same_timestamp_later_sequence_is_still_queued(self):
+        self.start()
+        arrived = time.monotonic()
+        self.send("意气风发", A, received_at=arrived, sequence=2)
+        count = len(self.ctx.sent)
+        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        self.send("大大方方", B, received_at=arrived, sequence=3)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+
+    def test_pre_reply_answer_with_larger_sequence_is_ignored(self):
+        self.start()
+        count = len(self.ctx.sent)
+        # 发题回复尚未完成时到达：即使 sequence 正常递增也不能进入下一轮。
+        self.send("意气风发", A, received_at=0)
+        self.assertEqual(len(self.ctx.sent), count)
+
+    def test_pre_reply_answer_with_larger_message_id_is_ignored(self):
+        members = FakeMembers()
+        members.latest = 10
+        self.ctx.members = members
+        self.start()
+        members.ids["意气风发"] = 99  # 记录线程晚提交，ID 比发题水位更大。
+        count = len(self.ctx.sent)
+        self.send("意气风发", A, received_at=0)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
+
+    def test_opening_still_starts_without_member_directory(self):
+        self.ctx = NoMemberContext()
+        self.plugin.on_load(self.ctx)
+        self.start()
+        self.assertIn(ROOM, self.plugin.games)
+        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        self.send("意气风发", A)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+
+    def test_reused_message_id_after_clear_still_counts(self):
+        members = FakeMembers()
+        members.latest = 10
+        self.ctx.members = members
+        self.start()
+        members.ids["意气风发"] = 1  # 清空后 rowid 从 1 重新分配。
+        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        self.send("意气风发", A)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+
+    def test_old_message_id_is_rejected_even_when_sequence_advanced(self):
+        members = FakeMembers()
+        members.latest = 10
+        self.ctx.members = members
+        self.start()
+        members.ids["意气风发"] = 10
+        count = len(self.ctx.sent)
+        self.send("意气风发", A, received_at=0)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
+
+    def test_reconnected_sequence_restart_still_counts(self):
+        members = FakeMembers()
+        members.history_enabled = False
+        self.ctx.members = members
+        self.start()
+        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        self.send("意气风发", A, session="two", sequence=1)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "发扬光大")
+
+    def test_equal_timestamp_uses_message_id_as_tiebreak(self):
+        members = FakeMembers()
+        members.latest = 10
+        self.ctx.members = members
+        self.start()
+        game = self.plugin.games[ROOM]
+        game.chain.ready_at = 100.0
+        members.ids["意气风发"] = 11  # ID 大于发题水位。
+        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        self.send("意气风发", A, received_at=100.0)
+        self.assertEqual(game.chain.current, "发扬光大")
+
+    def test_equal_timestamp_old_message_id_is_ignored(self):
+        members = FakeMembers()
+        members.latest = 10
+        self.ctx.members = members
+        self.start()
+        game = self.plugin.games[ROOM]
+        game.chain.ready_at = 100.0
+        members.ids["意气风发"] = 10  # ID 未超过发题水位。
+        count = len(self.ctx.sent)
+        self.send("意气风发", A, received_at=100.0)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(game.chain.current, "一心一意")
+
+    def test_equal_timestamp_uses_sequence_as_tiebreak(self):
+        self.start()
+        game = self.plugin.games[ROOM]
+        game.chain.ready_at = 100.0
+        self.ctx.llm.result["next_idiom"] = "发扬光大"
+        self.send("意气风发", A, received_at=100.0, sequence=2)
+        self.assertEqual(game.chain.current, "发扬光大")
+
+    def test_answer_queued_before_opening_reply_is_ignored(self):
+        arrived = time.monotonic()
+        self.send("成语接龙", sequence=1)
+        count = len(self.ctx.sent)
+        # 消息在开场题发出前就已到达，只是排队到发题完成后才被插件处理。
+        self.send("意气风发", A, received_at=arrived, sequence=1)
+        self.assertEqual(len(self.ctx.sent), count)
+        self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
 
     def test_merged_command_keeps_the_same_shared_chain(self):
         self.start()

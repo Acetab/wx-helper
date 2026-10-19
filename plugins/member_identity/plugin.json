@@ -1,5 +1,6 @@
 {
   "api": "v1",
-  "description": "成员本人发送 /绑定 昵称，自由注册或更新称呼，关联真实 ID 和聊天记录",
+  "author": "Inmata",
+  "description": "自动读取微信昵称；人物档案由管理员统一绑定、改名与维护",
   "requires": ["group.text.receive", "group.text.send"]
 }

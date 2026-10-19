@@ -33,6 +33,9 @@ class Chain:
     current: str
     used: tuple
     ready_at: float = 0
+    ready_id: int = 0
+    ready_sequence: int = 0
+    ready_session: str = ""
 
 
 @dataclass
@@ -44,7 +47,6 @@ class Game:
 
 class Plugin:
     def on_load(self, ctx):
-        self.judge = IdiomJudge(ctx.llm)
         self.games = {}
         self.room_state = getattr(ctx, "room_state", None)
         self.member_names = ctx.config.get("member_names", {})
@@ -144,6 +146,49 @@ class Plugin:
         self.games.pop(room, None)
         self._save(ctx, room)
 
+    @staticmethod
+    def _members(ctx):
+        """未配置成员目录时 PluginContext.members 会抛异常，这里统一降级为 None。"""
+        try:
+            return getattr(ctx, "members", None)
+        except Exception:
+            return None
+
+    def _stamp_ready(self, ctx, room, message, chain):
+        """记录发题完成时的水位：发题期间已到达的答案不能参与下一轮。"""
+        chain.ready_at = time.monotonic()
+        chain.ready_sequence = int(getattr(message, "sequence", 0) or 0)
+        chain.ready_session = getattr(message, "session_id", "") or ""
+        members = self._members(ctx)
+        if members is not None and getattr(members, "history_enabled", False):
+            try:
+                chain.ready_id = int(members.latest_id(room))
+            except Exception:
+                chain.ready_id = 0
+
+    def _is_new_answer(self, ctx, room, message, chain):
+        """先按接收时钟划清发题边界；只有时间戳相同时才用 ID/sequence 兜底。"""
+        if chain.ready_at and message.received_at != chain.ready_at:
+            # 发题完成前到达的答案（包括记录线程晚提交、ID 反而更大的）一律不算下一轮。
+            return message.received_at > chain.ready_at
+        members = self._members(ctx)
+        if members is not None and getattr(members, "history_enabled", False) and chain.ready_id:
+            try:
+                message_id = members.message_id(message)
+            except Exception:
+                message_id = None
+            if message_id is not None:
+                if message_id > chain.ready_id:
+                    return True
+                # 跨天清理会让 rowid 从 1 重新分配，ID 退回不代表消息旧。
+                return message.received_at > chain.ready_at
+        sequence = int(getattr(message, "sequence", 0) or 0)
+        same_session = not chain.ready_session or message.session_id == chain.ready_session
+        if sequence and chain.ready_sequence and same_session:
+            return sequence > chain.ready_sequence
+        # 断线重连后 sequence 会从 1 重新计数，只能靠接收时钟判断先后。
+        return message.received_at > chain.ready_at
+
     def _handle(self, message, ctx, personality):
         text = command_text(message.text)
         judge = IdiomJudge(ctx.llm_for(message, personality=personality))
@@ -170,7 +215,9 @@ class Plugin:
                 return
             reply = f"{opening}\n请接以“{opening[-1]}”开头的四字成语，发送“退出接龙”结束。"
             if ctx.reply(message, reply, delivery_guard=guard):
-                self.games[room] = Game(opening, Chain(opening, (opening,), time.monotonic()))
+                chain = Chain(opening, (opening,))
+                self._stamp_ready(ctx, room, message, chain)
+                self.games[room] = Game(opening, chain)
                 self._save(ctx, room)
             return
         if text == "合并接龙":
@@ -183,7 +230,7 @@ class Plugin:
         if not game or not answer or answer.startswith("/") or not FOUR_CHINESE.fullmatch(answer):
             return
         chain = game.chain
-        if message.received_at <= chain.ready_at:
+        if not self._is_new_answer(ctx, room, message, chain):
             return  # 同一轮判定/发题期间到达的抢答不重复计入。
         if answer[0] != chain.current[-1]:
             return  # 与当前接字无关的四字消息按普通聊天处理，不打断群聊。
@@ -194,7 +241,9 @@ class Plugin:
             ctx.logger.warning("接龙判定失败：%s", error)
             if ctx.reply_at(message, f"大模型暂时无法判定，请稍后重试。当前成语：{chain.current}",
                             display_name=name, delivery_guard=guard):
-                game.chain = Chain(chain.current, chain.used, time.monotonic())
+                next_chain = Chain(chain.current, chain.used)
+                self._stamp_ready(ctx, room, message, next_chain)
+                game.chain = next_chain
                 game.updated_at = time.monotonic()
                 self._save(ctx, room)
             return
@@ -210,6 +259,8 @@ class Plugin:
         else:
             response = game_reply(personality.name, verdict.accepted, verdict.reason, chain.current, answer, following)
         if ctx.reply_at(message, response, display_name=name, delivery_guard=guard):
-            game.chain = Chain(following, used, time.monotonic())
+            next_chain = Chain(following, used)
+            self._stamp_ready(ctx, room, message, next_chain)
+            game.chain = next_chain
             game.updated_at = time.monotonic()
             self._save(ctx, room)

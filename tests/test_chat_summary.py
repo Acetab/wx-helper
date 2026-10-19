@@ -155,7 +155,7 @@ class DailySummaryTests(unittest.TestCase):
 
     def test_unknown_member_and_no_chat_do_not_call_model(self):
         self.plugin.on_message(self.message("/总结 未绑定"), self.ctx)
-        self.assertIn("请本人先发送 /绑定", self.backend.sent[-1][1])
+        self.assertIn("人物绑定请由管理员维护", self.backend.sent[-1][1])
         self.plugin.on_message(self.message("/总结 测试成员"), self.ctx)
         self.assertIn("没有可总结", self.backend.sent[-1][1])
         self.assertEqual(self.calls, [])

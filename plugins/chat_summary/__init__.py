@@ -1,11 +1,10 @@
 ﻿"""按指定条数或今天的范围总结，默认跨天最近200条。"""
 from dataclasses import replace
-from datetime import datetime
-
 from wxbot_framework.commands import command_text, effective_text
 from wxbot_framework.llm import LLMError
-from wxbot_framework.members import BEIJING, MemberError, SnapshotExpired
+from wxbot_framework.members import MemberError, SnapshotExpired
 from wxbot_framework.summary import ChatSummarizer, split_text
+from wxbot_framework.timeutil import format_local
 
 USAGE = "用法：/总结群聊 [1—5000条或今天]；/总结 昵称 [1—5000条或今天]"
 
@@ -41,7 +40,7 @@ class Plugin:
         self.members = ctx.members
         if not self.members.history_enabled:
             raise ValueError("聊天总结需要 history_enabled=true")
-        self.summarizer = ChatSummarizer(ctx.llm, chunk_chars=ctx.config.get("chunk_chars", 16000))
+        self.chunk_chars = ctx.config.get("chunk_chars", 16000)
 
     def on_message(self, message, ctx):
         if (message.type != 1 or not message.is_group or message.chat_id not in self.members.groups or
@@ -61,7 +60,7 @@ class Plugin:
             else:
                 snapshot = self.members.recent_snapshot(message.chat_id, name=name, limit=count, before_id=anchor)
         except MemberError as error:
-            ctx.reply(message, str(error) + ("。请本人先发送 /绑定 昵称。" if str(error) != USAGE else ""))
+            ctx.reply(message, str(error) + ("。人物绑定请由管理员维护。" if str(error) != USAGE else ""))
             return
         rows = snapshot.messages
         personality = ctx.personality(message)
@@ -71,10 +70,11 @@ class Plugin:
                 ctx.reply(message, "所选范围内没有可总结的聊天记录。", delivery_guard=guard)
                 return
             summarizer = ChatSummarizer(ctx.llm_for(message, personality=personality),
-                                       chunk_chars=self.summarizer.chunk_chars)
+                                       chunk_chars=self.chunk_chars,
+                                       display_timezone=ctx.display_timezone)
             summary = summarizer.summarize(snapshot, rows,
                 current=lambda: self.members.snapshot_is_current(snapshot))
-            start, end = [datetime.fromisoformat(row["received_at"]).astimezone(BEIJING).strftime("%Y-%m-%d %H:%M")
+            start, end = [format_local(row["received_at"], ctx.display_timezone)
                           for row in (rows[0], rows[-1])]
             label = "今日" if scope == "today" else "最近"
             target = "群聊总结" if group else snapshot.member.name + " 聊天总结"
