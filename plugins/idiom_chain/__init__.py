@@ -255,7 +255,7 @@ class Plugin:
                 used += (following,)
         if verdict.accepted and not verdict.next_idiom:
             response = (f"接得漂亮！{chain.current} → {answer}\n"
-                        f"这轮我没接上，大家继续接以“{answer[-1]}”开头的四字成语。")
+                        f"这轮我接不上，认输。大家继续接以“{answer[-1]}”开头的四字成语。")
         else:
             response = game_reply(personality.name, verdict.accepted, verdict.reason, chain.current, answer, following)
         if ctx.reply_at(message, response, display_name=name, delivery_guard=guard):

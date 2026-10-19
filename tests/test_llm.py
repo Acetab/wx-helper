@@ -156,34 +156,15 @@ class JudgeTests(unittest.TestCase):
                 result = self.judge.evaluate("一心一意", "意气风发", ("一心一意", "发扬光大"))
                 self.assertTrue(result.accepted)
                 self.assertEqual(result.next_idiom, "")
-                self.assertEqual(len(self.client.calls), 2)
+                self.assertEqual(len(self.client.calls), 1)
 
-    def test_invalid_next_word_is_corrected_without_rejudging_player(self):
-        self.client.complete_json = Mock(side_effect=[
-            {"is_idiom": True, "reason": "常见成语", "next_idiom": "可歌可泣"},
-            {"next_idiom": "声东击西"}])
-        used = ("万事如意", "意有所指", "指日可待", "待人接物", "物是人非", "非同小可", "可歌可泣")
-        result = self.judge.evaluate("可歌可泣", "泣不成声", used)
-        self.assertTrue(result.accepted)
-        self.assertEqual(result.next_idiom, "声东击西")
-        correction = json.loads(self.client.complete_json.call_args.args[1])
-        self.assertEqual(correction["required_first"], "声")
-        self.assertEqual(correction["used"], [*used, "泣不成声"])
-        self.assertEqual(correction["rejected_next"], "可歌可泣")
-
-    def test_next_word_request_failure_does_not_undo_an_accepted_answer(self):
-        self.client.complete_json = Mock(side_effect=[
-            {"is_idiom": True, "reason": "常见成语", "next_idiom": "假的"}, LLMError("测试超时")])
+    def test_invalid_next_word_concedes_without_a_correction_call(self):
+        self.client.result["next_idiom"] = "假的"
         result = self.judge.evaluate("一心一意", "意气风发", ("一心一意",))
         self.assertTrue(result.accepted)
+        self.assertEqual(result.reason, "常见成语")
         self.assertEqual(result.next_idiom, "")
-
-    def test_malformed_next_word_correction_does_not_undo_an_accepted_answer(self):
-        self.client.complete_json = Mock(side_effect=[
-            {"is_idiom": True, "reason": "常见成语", "next_idiom": "假的"}, None])
-        result = self.judge.evaluate("一心一意", "意气风发", ("一心一意",))
-        self.assertTrue(result.accepted)
-        self.assertEqual(result.next_idiom, "")
+        self.assertEqual(len(self.client.calls), 1)
 
     def test_model_boolean_is_strict(self):
         self.client.result["is_idiom"] = "true"
