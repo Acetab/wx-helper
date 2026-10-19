@@ -34,7 +34,7 @@ def answer_text(text):
 class Chain:
     current: str
     used: tuple
-    ready_at: float = 0
+    ready_sequence: int = 0
 
 
 @dataclass
@@ -53,7 +53,8 @@ class Game:
 
 class Plugin:
     def on_load(self, ctx):
-        self.judge = IdiomJudge(ctx.llm)
+        self.judge = IdiomJudge(None)
+        self.sequence_epoch = ctx.message_epoch
         self.games = {}
         self.room_state = getattr(ctx, "room_state", None)
         self.member_names = ctx.config.get("member_names", {})
@@ -136,6 +137,11 @@ class Plugin:
             return None
         # 续局保留剩余空闲时间：重启本身不给这一局续命。
         game = Game(words[0], Chain(current, words), time.monotonic() - age, goal=self.goal)
+        if self.sequence_epoch and state.get("sequence_epoch") == self.sequence_epoch:
+            ready_sequence = state.get("ready_sequence", 0)
+            if type(ready_sequence) is not int or ready_sequence < 0:
+                return None
+            game.chain.ready_sequence = ready_sequence
         if state.get("version") == 2:
             rounds, goal = state.get("rounds"), state.get("goal")
             hints, swaps, scores = state.get("hints_left"), state.get("swaps_left"), state.get("scores")
@@ -170,6 +176,7 @@ class Plugin:
                     "rounds": game.rounds, "goal": game.goal, "scores": game.scores,
                     "hints_left": game.hints_left, "swaps_left": game.swaps_left,
                     "last_player": game.last_player, "hint_word": game.hint_word,
+                    "sequence_epoch": self.sequence_epoch, "ready_sequence": game.chain.ready_sequence,
                     "idle_seconds": self.idle_seconds,
                     "updated_at": datetime.now(timezone.utc).isoformat()})
         except Exception as error:  # 进度只用于续局，存不下不影响本轮接龙
@@ -190,12 +197,16 @@ class Plugin:
 
     def _commit(self, ctx, room, game):
         game = replace(game, updated_at=time.monotonic(),
-                       chain=replace(game.chain, ready_at=time.monotonic()))
+                       chain=replace(game.chain, ready_sequence=ctx.message_watermark(room)))
         self.games[room] = game
         self._save(ctx, room)
 
+    @staticmethod
+    def _is_new_answer(message, chain):
+        return message.dispatch_sequence > chain.ready_sequence
+
     def _assist(self, text, message, ctx, game, judge, guard):
-        if message.received_at <= game.chain.ready_at:
+        if not self._is_new_answer(message, game.chain):
             return
         current, used = game.chain.current, game.chain.used
         if text == "接龙提示":
@@ -283,7 +294,7 @@ class Plugin:
         if not game or (not explicit and (not answer or not FOUR_CHINESE.fullmatch(answer))):
             return
         chain = game.chain
-        if message.received_at <= chain.ready_at:
+        if not self._is_new_answer(message, chain):
             return  # 同一轮判定/发题期间到达的抢答不重复计入。
         if not explicit and answer[0] != chain.current[-1]:
             return  # 与当前接字无关的四字消息按普通聊天处理，不打断群聊。

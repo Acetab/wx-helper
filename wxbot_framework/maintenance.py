@@ -13,6 +13,7 @@ from .members import MemberError, parse_aliases
 from .mentions import strip_at_labels
 from .summary import split_text
 from .text import validate_target
+from .timeutil import format_local
 
 logger = logging.getLogger("Maintenance")
 ADMIN_ROOTS = frozenset({
@@ -24,6 +25,8 @@ HELP = """管理员快捷命令（群聊与私聊通用，含空格时用英文�
 /绑定 <@群友|M序号|微信昵称|wxid> <人物名> [--强制]
 /解绑 <@群友|M序号|微信昵称|wxid|人物名>
 /人物 [页码|人物名|#编号]
+/人物 待补绑
+/人物 隔离|恢复|合并 人物 [#编号]
 /别名 <人物名> <+新别名|-旧别名>
 /改名 <人物名> <新主名>
 /记住 <人物名> <主题> [类别] <内容>
@@ -39,24 +42,29 @@ HELP = """管理员快捷命令（群聊与私聊通用，含空格时用英文�
 /管理 人物 查看|新建|解绑|清空|修订 人物
 /管理 人物 改名 人物 新名字
 /管理 人物 关联 人物 微信ID
+/管理 人物 隔离|恢复 人物
+/管理 人物 合并 源人物 保留人物
+/管理 人物 待补绑
 /管理 确认 操作编号
 /管理 别名 添加|删除 人物 别名
 /管理 成员 列表|未绑定|已绑定|同步
 /管理 记忆 列表|历史 人物 [页码]
+/管理 记忆 候选 [页码]
 /管理 记忆 新增 人物 主题 类别 正文
 /管理 记忆 修改|移动|分类 编号 参数
 /管理 记忆 停用|恢复|来源|修订 编号 [页码]
 /管理 学习 开启|关闭|立即处理
 /管理 定时 开启|关闭|设置 开始小时 结束小时 最近条数
 /管理 插件 列表|启用 名称|停用 名称|重载 [名称]
-/管理 公告 状态|重发"""
+/管理 公告 状态|重发 [公告ID]"""
 
 
-def maintenance_options(config):
+def maintenance_options(config, *, contributors=None):
     options = config.get("maintenance", {})
     if not isinstance(options, dict):
         raise ValueError("maintenance 应为 JSON 对象")
-    options = {"default_room": None, "upgrade_file": None, "announcement": None, **options}
+    options = {"default_room": None, "upgrade_file": None, "announcement": None,
+               "announcements": [], **options}
     if options["default_room"] is not None:
         validate_target(options["default_room"])
         if not options["default_room"].endswith("@chatroom"):
@@ -64,20 +72,56 @@ def maintenance_options(config):
     path = options["upgrade_file"]
     if path is not None and (not isinstance(path, str) or not path.strip() or "\0" in path):
         raise ValueError("upgrade_file 应为本地文件路径或 null")
-    notice = options["announcement"]
-    if notice is not None:
-        if not isinstance(notice, dict) or not all(isinstance(notice.get(k), str) and notice[k].strip() for k in ("id", "room", "text")):
-            raise ValueError("announcement 需要 id、room、text")
-        validate_target(notice["room"])
-        if not notice["room"].endswith("@chatroom") or len(notice["id"]) > 80 or len(notice["text"].encode("utf-8")) > 900 or "\0" in notice["text"]:
-            raise ValueError("更新公告目标或正文不正确")
+    legacy = options["announcement"]
+    announcements = options["announcements"]
+    if not isinstance(announcements, list):
+        raise ValueError("maintenance.announcements 应为公告数组")
+    if legacy is not None and announcements:
+        raise ValueError("maintenance.announcement 与 announcements 不能同时配置")
+    if legacy is not None:
+        announcements = [legacy]
+    seen = set()
+    normalized = []
+    for notice in announcements:
+        if not isinstance(notice, dict):
+            raise ValueError("每份公告应为 JSON 对象")
+        notice_id, room = notice.get("id"), notice.get("room")
+        text = notice.get("text")
+        plugins = notice.get("plugins", [])
+        if (not isinstance(notice_id, str) or not notice_id.strip() or len(notice_id) > 80 or
+                not isinstance(room, str)):
+            raise ValueError("公告需要 id、room")
+        validate_target(room)
+        if not room.endswith("@chatroom") or notice_id in seen:
+            raise ValueError("公告目标群或 ID 不正确/重复")
+        if text is not None and (not isinstance(text, str) or "\0" in text):
+            raise ValueError("公告 text 应为字符串或 null")
+        if not isinstance(plugins, list) or not all(isinstance(name, str) and name for name in plugins):
+            raise ValueError("公告 plugins 应为插件名数组")
+        if len(set(plugins)) != len(plugins):
+            raise ValueError("公告 plugins 不能重复")
+        text_bytes = len((text or "").encode("utf-8"))
+        if text_bytes > 900:
+            raise ValueError("公告正文不能超过 900 个 UTF-8 字节")
+        seen.add(notice_id)
+        normalized.append({"id": notice_id, "room": room, "plugins": list(plugins), "text": text})
+    options["announcement"] = legacy
+    options["announcements"] = normalized
+    for notice in normalized:
+        from .upgrades import announcement_text
+        if len(announcement_text(notice, contributors).encode("utf-8")) > 900:
+            raise ValueError(f"公告 {notice['id']} 含插件贡献后超过 900 个 UTF-8 字节")
     return options
 
 
 class MaintenanceService:
-    def __init__(self, knowledge, *, app=None, options=None):
+    def __init__(self, knowledge, *, app=None, options=None, display_timezone=None):
         self.knowledge, self.members, self.app = knowledge, knowledge.members, app
         self.options = options or {}
+        self.display_timezone = (
+            display_timezone or
+            (app.config.get("display_timezone", "Asia/Shanghai") if app else None) or
+            getattr(knowledge, "display_timezone", None) or "Asia/Shanghai")
         self._lock = threading.RLock()
 
     def room(self, explicit=None, current=None):
@@ -109,10 +153,7 @@ class MaintenanceService:
                 synced = self.app.sync_wechat_directory(room) if self.app else {"members": 0, "names": 0}
                 return f"已同步微信内存群成员缓存：成员 {synced['members']} 人，有效微信昵称 {synced['names']} 个。"
             if words == ["状态"]:
-                state = {"目标群": room, "知识库": self.knowledge.status(), "已连接": bool(self.app and self.app._connection_ready)}
-                if self.app:
-                    state.update(学习=self.app.memory_options, 定时=self.app.hourly_options)
-                return json.dumps(state, ensure_ascii=False, indent=2)
+                return self._status_text(room)
             if words[:1] == ["确认"] and len(words) == 2:
                 name = self.knowledge.confirm_clear(room, words[1], editor)
                 return f"已清空{name}的现行资料；将从此后的新聊天继续学习，原文和旧资料历史保留。"
@@ -139,6 +180,36 @@ class MaintenanceService:
         # 启停线程、等待插件退出与发送公告均不能占数据库锁。
         with self._lock:
             return self._runtime(room, words)
+
+    def _status_text(self, room):
+        """维护状态用中文分组展示，不直接输出内部字段字典。"""
+        state = self.knowledge.status()
+        display = self.display_timezone
+        lines = [f"目标群：{room}", f"微信连接：{'已连接' if self.app and self.app._connection_ready else '未连接'}",
+                 f"长期记忆：现行 {state['active_memories']} 条｜候选 {state.get('candidate_memories', 0)} 条"
+                 f"｜隔离人物 {state.get('quarantined_people', 0)} 份"]
+        if self.app:
+            memory, hourly = self.app.memory_options, self.app.hourly_options
+            lines.append(f"自动学习：{'已开启' if memory.get('enabled') else '已关闭'}"
+                         f"（每批 {memory.get('batch_size')} 条，{memory.get('flush_seconds')} 秒兜底一次）")
+            start, end = hourly.get("start_hour"), hourly.get("end_hour")
+            lines.append(f"主动发言：{'已开启' if hourly.get('enabled') else '已关闭'}"
+                         f"（白天间隔 {hourly.get('active_min_minutes')}—{hourly.get('active_max_minutes')} 分钟，"
+                         f"晚间间隔 {hourly.get('evening_min_minutes')}—{hourly.get('evening_max_minutes')} 分钟）")
+            lines.append(f"发言窗口：北京时间 {start:02d}:00—{end:02d}:00"
+                         f"（{end:02d}:00—{start:02d}:00 静默）；日上限 {hourly.get('daily_limit')} 次，"
+                         f"冷却 {hourly.get('cooldown_minutes')} 分钟")
+            lines.append(f"活跃筛选：最近 {hourly.get('activity_window_minutes')} 分钟至少 "
+                         f"{hourly.get('min_messages')} 条、{hourly.get('min_speakers')} 位成员；"
+                         f"上下文最近 {hourly.get('context_limit')} 条")
+        for row in state["learning"]:
+            detail = f"· {row['room']}：游标 #{row['cursor_id']}"
+            if row.get("updated_at"):
+                detail += f"，最近 {format_local(row['updated_at'], display)}"
+            if row.get("last_error"):
+                detail += f"，最近错误 {row['last_error']}"
+            lines.append(detail)
+        return "\n".join(lines)
 
     def _bind_shortcut(self, room, words, editor, *, at_members=()):
         force = False
@@ -238,26 +309,53 @@ class MaintenanceService:
                 page = self.page(words[0])
             entities = [e for e in k._entities(room) if e["entity_key"].startswith("person:")]
             code_by_wxid = {entry["wxid"]: entry["code"] for entry in self.members.room_member_directory(room)}
-            return f"人物共{len(entities)}份，第{page}页：\n" + "\n".join(
-                f"#{e['id']} {e['name']}｜别名：{'、'.join(parse_aliases(e['aliases'])) or '无'}｜"
-                + (f"已绑 {code_by_wxid.get(e['wxid'], '')} 微信:{self.members.wechat_name(e['wxid']) or e['wxid']}" if e["wxid"] else "未绑定")
-                for e in entities[(page-1)*20:page*20])
+            active = [e for e in entities if e["status"] == "active"]
+            quarantined = [e for e in entities if e["status"] == "quarantined"]
+            pending = [e for e in active if not e["wxid"]]
+            lines = [f"人物共 {len(active)} 份（隔离 {len(quarantined)} 份，待补绑 {len(pending)} 份），第 {page} 页："]
+            for e in active[(page-1)*20:page*20]:
+                if e["wxid"]:
+                    state = f"已绑 {code_by_wxid.get(e['wxid'], '')} 微信:{self.members.wechat_name(e['wxid']) or e['wxid']}"
+                else:
+                    state = "待补绑"
+                lines.append(f"#{e['id']} {e['name']}｜别名：{'、'.join(parse_aliases(e['aliases'])) or '无'}｜{state}")
+            return "\n".join(lines)
+        if words[:1] == ["待补绑"]:
+            pending = k.pending_binding(room)
+            if not pending:
+                return "没有待补绑的人物档案。"
+            return f"待补绑人物 {len(pending)} 份（资料保留，确认身份后请 /绑定）：\n" + "\n".join(
+                f"#{e['id']} {e['name']}｜别名：{'、'.join(parse_aliases(e['aliases'])) or '无'}" for e in pending[:20])
         if len(words) == 1:
             words = ["查看", words[0]]
         if len(words) < 2:
-            raise MemberError("用法：/管理 人物 查看|新建|改名|关联|解绑|清空|修订 人物")
+            raise MemberError("用法：/管理 人物 查看|新建|改名|关联|解绑|清空|修订|隔离|恢复|合并|待补绑 人物")
         action, value = words[:2]
         if action == "新建" and len(words) == 2:
             entity = k.entity(room, value, pinned=True)
             with k._db():
                 k.entity_audit(room, entity["id"], editor, "create", {}, entity)
             return f"人物已就绪：#{entity['id']} {entity['name']}。"
+        if action == "隔离" and len(words) == 2:
+            entity = k.quarantine_person(room, value, editor)
+            return (f"已隔离 #{entity['id']} {entity['name']}：不再出现在列表、检索和模型上下文，"
+                    f"资料与来源保留；核对后可用 /管理 人物 恢复 #{entity['id']} 还原。")
+        if action == "恢复" and len(words) == 2:
+            entity = k.restore_person(room, value, editor)
+            return f"已恢复 #{entity['id']} {entity['name']}。"
+        if action == "合并" and len(words) == 3:
+            source, target = words[1], words[2]
+            merged, moved = k.merge_person(room, source, target, editor)
+            return (f"已把 {source} 合并到 #{merged['id']} {merged['name']}，迁移 {moved} 条记忆；"
+                    f"原主名保留为别名。")
         entity = k.admin_entity(room, value)
         if action == "查看" and len(words) == 2:
             _, count, items = k.admin_items(room, entity["id"])
             wechat = f"{self.members.wechat_name(entity['wxid']) or '未缓存'} ({entity['wxid']})" if entity["wxid"] else "未绑定"
-            return (f"#{entity['id']} {entity['name']}\n别名：{'、'.join(parse_aliases(entity['aliases'])) or '无'}\n"
-                    f"绑定微信：{wechat}\n现行资料{count}条，清空后学习起点 #{entity['learning_floor']}\n" + self.format_items(items))
+            status = "已隔离" if entity["status"] == "quarantined" else "正常"
+            head = (f"#{entity['id']} {entity['name']}（{status}）\n别名：{'、'.join(parse_aliases(entity['aliases'])) or '无'}\n"
+                    f"绑定微信：{wechat}\n现行资料 {count} 条，清空后学习起点 #{entity['learning_floor']}")
+            return head + ("\n" + self.format_items(items) if items else "\n本页没有条目。")
         if action == "改名" and len(words) == 3:
             k.change_identity(room, value, editor, name=words[2])
             return "已改名，原名字保留为别名；可另行删除旧别名。"
@@ -275,15 +373,41 @@ class MaintenanceService:
             page = self.page(words[2]) if len(words) == 3 else 1
             rows = k._db().execute("SELECT action,previous,replacement,edited_at FROM knowledge_entity_edits WHERE account=? AND room=? AND entity_id=? ORDER BY id DESC LIMIT 5 OFFSET ?",
                                    (k.account, room, entity["id"], (page-1)*5)).fetchall()
-            return "\n".join(json.dumps(dict(r), ensure_ascii=False) for r in rows) or "本页没有操作记录。"
+            return self.format_entity_edits(rows, self.display_timezone) or "本页没有操作记录。"
         raise MemberError("人物命令参数不正确，请发送 /管理 帮助")
 
     @staticmethod
     def format_items(items):
-        return "\n".join(f"#{i['id']} {i['slot']}｜{i['kind']}｜{i['status']}\n{i['content']}" for i in items) or "本页没有条目。"
+        return "\n".join(f"#{i['id']} {i['slot']}｜{i['kind']}｜{i['status']}\n　{i['content']}" for i in items)
+
+    @staticmethod
+    def format_entity_edits(rows, display_timezone=None):
+        labels = {"create": "新建", "identity": "改名/别名", "link": "绑定", "unlink": "解绑",
+                  "quarantine": "隔离", "restore-person": "恢复", "merge-person": "合并",
+                  "clear-and-relearn": "清空重学", "move-memory": "移动记忆", "classify-memory": "改类别",
+                  "owner-confirmed": "人工确认", "remove-aliases": "删除别名"}
+        lines = []
+        for row in rows:
+            text = json.dumps(dict(row), ensure_ascii=False)
+            lines.append(f"· {format_local(row['edited_at'], display_timezone)}｜"
+                         f"{labels.get(row['action'], row['action'])}｜{text}")
+        return "\n".join(lines)
 
     def _memory(self, room, words, editor):
         k = self.knowledge
+        if words[:1] == ["候选"] and len(words) in (1, 2):
+            page = self.page(words[1]) if len(words) == 2 else 1
+            rows = k._db().execute("""SELECT i.id,i.slot,i.kind,i.content,i.updated_at,e.name
+                FROM knowledge_items i JOIN knowledge_entities e ON e.id=i.entity_id
+                WHERE i.account=? AND i.room=? AND i.status='candidate' ORDER BY i.updated_at DESC LIMIT 10 OFFSET ?""",
+                (k.account, room, (page-1)*10)).fetchall()
+            if not rows:
+                return "没有待沉淀的候选公共记忆。"
+            lines = [f"候选公共记忆（第 {page} 页，攒够 3 条跨 2 位成员的证据后自动生效）："]
+            lines += [f"#{r['id']} {r['name']}｜{r['kind']}：{r['content']}\n"
+                      f"　最近 {format_local(r['updated_at'], self.display_timezone)}"
+                      for r in rows]
+            return "\n".join(lines)
         if len(words) >= 2 and words[0] in ("列表", "历史") and len(words) in (2, 3):
             page = self.page(words[2]) if len(words) == 3 else 1
             entity, count, items = k.admin_items(room, words[1], page=page, history=words[0] == "历史")
@@ -314,10 +438,23 @@ class MaintenanceService:
             if action == "来源":
                 rows = k._db().execute("SELECT origin,message_id,source_time FROM knowledge_sources WHERE item_id=? ORDER BY source_time DESC LIMIT 10 OFFSET ?",
                                        (item["id"], (page-1)*10)).fetchall()
+                lines = [f"#{item['id']} {item['slot']} 的来源："]
+                for row in rows:
+                    if row["message_id"] is not None:
+                        lines.append(f"· 聊天记录 #{row['message_id']}｜"
+                                     f"{format_local(row['source_time'], self.display_timezone)}")
+                    else:
+                        lines.append(f"· {row['origin']}｜"
+                                     f"{format_local(row['source_time'], self.display_timezone)}")
+                return "\n".join(lines) if rows else "本页没有记录。"
             else:
                 rows = k._db().execute("SELECT action,previous,replacement,edited_at FROM knowledge_edits WHERE item_id=? ORDER BY id DESC LIMIT 10 OFFSET ?",
                                        (item["id"], (page-1)*10)).fetchall()
-            return "\n".join(json.dumps(dict(r), ensure_ascii=False) for r in rows) or "本页没有记录。"
+                lines = [f"#{item['id']} {item['slot']} 的修订记录："]
+                for row in rows:
+                    lines.append(f"· {format_local(row['edited_at'], self.display_timezone)}｜{row['action']}\n"
+                                 f"　前：{row['previous']}\n　后：{row['replacement']}")
+                return "\n".join(lines) if rows else "本页没有记录。"
         raise MemberError("记忆命令参数不正确，请发送 /管理 帮助")
 
     def _members(self, room, words, editor):
@@ -372,28 +509,47 @@ class MaintenanceService:
             else:
                 raise MemberError("用法：/管理 定时 开启|关闭 或 /管理 定时 设置 9 23 200")
             app.update_feature("hourly_chat", changes)
-            return "已更新整点发言设置（作用于全部配置群），不补发已过时段。"
+            return "已更新随机主动发言设置（作用于全部配置群），不补发已过时段。"
         if words[:1] == ["插件"]:
             if words == ["插件", "列表"]:
-                return json.dumps(app.plugins.status(), ensure_ascii=False)
+                rows = app.plugins.status()
+                lines = ["插件状态："]
+                for row in rows:
+                    if not isinstance(row, dict):
+                        lines.append(f"· {row}")
+                        continue
+                    name = row.get("name", "未知")
+                    enabled = row.get("enabled", row.get("active"))
+                    state = "已启用" if enabled else "未启用"
+                    detail = row.get("error") or row.get("reason") or ""
+                    lines.append(f"· {name}：{state}" + (f"（{detail}）" if detail else ""))
+                return "\n".join(lines)
             if len(words) == 3 and words[1] in ("启用", "停用"):
                 getattr(app.plugins, "enable" if words[1] == "启用" else "disable")(words[2])
                 return "已更新插件状态，维护入口继续可用。"
             if words[1:2] == ["重载"] and len(words) in (2, 3):
                 app.plugins.reload(words[2] if len(words) == 3 else None)
                 return "已重载插件。"
-        if words[:1] == ["公告"] and len(words) == 2:
+        if words[:1] == ["公告"] and len(words) in (2, 3):
             if not app.startup_notice:
                 raise MemberError("尚未配置本次更新公告")
             if words[1] == "状态":
-                info = app.startup_notice.describe()
-                return (f"本版本公告状态：{info['status']}（id={info['id']}，群={info['room']}，"
-                        f"最近尝试={info['updated_at'] or '尚未发送'}）")
+                infos = app.startup_notice.all_status() if len(words) == 2 else [app.startup_notice.describe(words[2])]
+                display = app.config.get("display_timezone", "Asia/Shanghai")
+                lines = []
+                for info in infos:
+                    recent = format_local(info["updated_at"], display) if info["updated_at"] else "尚无"
+                    lines.append(f"{info['id']}：{info['status']}，群={info['room']}，本运行最近尝试={recent}")
+                return "公告状态：\n" + "\n".join(lines)
             if words[1] == "重发":
                 if not app._connection_ready:
                     raise MemberError("微信尚未连接，未重发公告")
-                app.startup_notice.retry()
-                return "已发送更新公告。" if app.startup_notice.send() else "公告结果待确认，请检查群聊与公告状态。"
+                notice_id = words[2] if len(words) == 3 else None
+                try:
+                    sent = app.startup_notice.resend(notice_id)
+                except ValueError as error:
+                    raise MemberError(str(error)) from None
+                return "已发送更新公告。" if sent else "公告结果待确认，请检查群聊与公告状态。"
         raise MemberError("未知维护命令，请发送 /管理 帮助")
 
 

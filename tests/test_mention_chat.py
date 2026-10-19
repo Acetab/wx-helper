@@ -118,9 +118,9 @@ class DialoguePayloadTests(unittest.TestCase):
         def __init__(self):
             self.payload = None
 
-        def complete_json(self, system, user):
+        def complete_text(self, system, user, **options):
             self.payload = json.loads(user)
-            return {"reply": "好"}
+            return "好"
 
     def snapshot(self):
         return ConversationSnapshot(ROOM, "2026-10-16", 0, "小明", (), "这是什么进度", ())
@@ -140,6 +140,13 @@ class DialoguePayloadTests(unittest.TestCase):
     def test_reply_without_game_still_works(self):
         client = self.Client()
         self.assertEqual(Dialogue(client).reply(self.snapshot()), "好")
+
+    def test_legacy_json_reply_from_model_is_still_unwrapped(self):
+        class LegacyClient:
+            def complete_text(self, system, user, **options):
+                return '{"reply":"旧格式也能正常显示"}'
+
+        self.assertEqual(Dialogue(LegacyClient()).reply(self.snapshot()), "旧格式也能正常显示")
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ class FixedPersonalityTests(unittest.TestCase):
 
     def setup_chat(self, provider=None):
         self.backend.send_at_text = lambda room, text, ids: self.backend.sent.append((room, text, ids)) or True
-        self.ctx._llm = Mock(complete_json=provider or Mock(return_value={"reply": "这是自然具体的回答。"}))
+        self.ctx._llm = Mock(complete_text=provider or Mock(return_value="这是自然具体的回答。"))
         plugin = ChatPlugin()
         plugin.on_load(self.ctx)
         return plugin
@@ -60,7 +60,7 @@ class FixedPersonalityTests(unittest.TestCase):
     def test_group_and_own_context_are_separate_and_keep_real_at(self):
         self.store.record(self.message("本人前文", sequence=1))
         self.store.record(self.message("别人聊吉他", sender=OTHER, sequence=2))
-        provider = Mock(return_value={"reply": "刚才大家聊吉他，你也想试试吗？"})
+        provider = Mock(return_value="刚才大家聊吉他，你也想试试吗？")
         plugin = self.setup_chat(provider)
         plugin.on_message(self.chat("刚才聊什么？"), self.ctx)
         payload = json.loads(provider.call_args.args[1])
@@ -81,10 +81,22 @@ class FixedPersonalityTests(unittest.TestCase):
         self.assertEqual([row["text"] for row in self.store.conversation_snapshot(msg).messages],
                          [f"前文{number}" for number in range(2, 12)])
 
+    def test_robot_reply_is_saved_and_reused_as_assistant_context(self):
+        provider = Mock(return_value="B 是这样来的。")
+        plugin = self.setup_chat(provider)
+        plugin.on_message(self.chat("A 是什么？", sequence=10), self.ctx)
+        stored = self.store.recent_rows(ROOM, include_bot=True)
+        self.assertIn("B 是这样来的。", [row["text"] for row in stored])
+        plugin.on_message(self.chat("那你为什么觉得 B 是这样？", sequence=11), self.ctx)
+        history = provider.call_args.kwargs["history"]
+        self.assertEqual([row["role"] for row in history], ["user", "assistant"])
+        self.assertIn("A 是什么", history[0]["content"])
+        self.assertEqual(history[1]["content"], "B 是这样来的。")
+
     def test_cross_day_does_not_cancel_reply(self):
         def change(*args, **kwargs):
             self.now += timedelta(seconds=1)
-            return {"reply": "跨天仍能继续这段对话。"}
+            return "跨天仍能继续这段对话。"
         plugin = self.setup_chat(change)
         plugin.on_message(self.chat(), self.ctx)
         self.assertIn("跨天仍能", self.backend.sent[-1][1])
@@ -92,13 +104,13 @@ class FixedPersonalityTests(unittest.TestCase):
     def test_context_reset_during_model_request_discards_result(self):
         def change(*args, **kwargs):
             self.store.reset_context(ROOM)
-            return {"reply": "这条已经过时"}
+            return "这条已经过时"
         plugin = self.setup_chat(change)
         plugin.on_message(self.chat(), self.ctx)
         self.assertEqual(self.backend.sent, [])
 
     def test_mention_of_other_person_and_command_do_not_call_model(self):
-        provider = Mock(return_value={"reply": "回答"})
+        provider = Mock(return_value="回答")
         plugin = self.setup_chat(provider)
         for msg in (self.chat(at_members=(OTHER,)), self.chat("/绑定 新名", sequence=101),
                     self.chat(sequence=102, bot_generated=True), self.message("@机器人 只有文字"),
@@ -115,7 +127,7 @@ class FixedPersonalityTests(unittest.TestCase):
         self.assertNotIn("/绑定", self.backend.sent[-1][1])
 
     def test_bound_person_uses_wechat_name_for_at_and_person_name_for_llm_context(self):
-        provider = Mock(return_value={"reply": "你是示例人物乙（乙哥），长语音担当。"})
+        provider = Mock(return_value="你是示例人物乙（乙哥），长语音担当。")
         plugin = self.setup_chat(provider)
         kb = self.ctx.knowledge
         person = kb.entity(ROOM, "示例人物乙", aliases=["乙哥", "小乙"], pinned=True)
@@ -134,14 +146,14 @@ class FixedPersonalityTests(unittest.TestCase):
         self.assertTrue(self.backend.sent[-1][1].startswith("@示例微信昵称\u2005\n"))
 
     def test_long_reply_respects_byte_limit_and_is_not_twenty_characters(self):
-        plugin = self.setup_chat(Mock(return_value={"reply": "中文🌸" * 190}))
+        plugin = self.setup_chat(Mock(return_value="中文🌸" * 190))
         plugin.on_message(self.chat(), self.ctx)
         self.assertGreater(len(self.backend.sent), 1)
         self.assertTrue(all(len(row[1].encode("utf-8")) <= 1023 for row in self.backend.sent))
         self.assertTrue(all(row[2] == (CAT,) for row in self.backend.sent))
 
     def test_invalid_model_reply_preserves_context(self):
-        plugin = self.setup_chat(Mock(return_value={"reply": ""}))
+        plugin = self.setup_chat(Mock(return_value=""))
         plugin.on_message(self.chat(), self.ctx)
         self.assertIn("暂时无法回复", self.backend.sent[-1][1])
         self.assertTrue(self.store.history("测试成员", ROOM))
@@ -154,6 +166,7 @@ class FixedPersonalityTests(unittest.TestCase):
     def test_runtime_prepares_reset_before_dispatch(self):
         app = object.__new__(BotApplication)
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
+        app.plugins.capture.side_effect = lambda message: message
         self.store.record(self.message("旧消息"))
         snapshot = self.store.recent_snapshot(ROOM)
         app._emit(self.message("/清空"))

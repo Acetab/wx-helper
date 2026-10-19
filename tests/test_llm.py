@@ -75,16 +75,53 @@ class LLMTests(unittest.TestCase):
                 self.assertNotIn("dummy-test-key", str(caught.exception))
 
     def test_malformed_or_truncated_model_results(self):
-        for content in ("", "not json", "[]", None):
-            with self.subTest(content=content), patch("wxbot_framework.llm.urlopen", return_value=self.response(content)):
+        for content in ("", "[]", None):
+            with (self.subTest(content=content),
+                  patch("wxbot_framework.llm.urlopen", side_effect=lambda *a, _c=content, **k: self.response(_c))):
                 with self.assertRaises(LLMError):
                     self.client.complete_json("JSON", "测试")
+        with patch("wxbot_framework.llm.urlopen", side_effect=lambda *a, _c="not json", **k: self.response(_c)) as call:
+            with self.assertRaisesRegex(LLMError, "补救"):
+                self.client.complete_json("JSON", "测试")
+        self.assertEqual(call.call_count, 2)
         with patch("wxbot_framework.llm.urlopen", return_value=self.response("{}", finish_reason="length")):
             with self.assertRaisesRegex(LLMError, "截断"):
                 self.client.complete_json("JSON", "测试")
         with patch("wxbot_framework.llm.urlopen", return_value=io.BytesIO(b'{"choices":[null]}')):
             with self.assertRaises(LLMError):
                 self.client.complete_json("JSON", "测试")
+
+    def test_broken_json_is_repaired_once_within_the_same_budget(self):
+        responses = [self.response("这不是 JSON"), self.response('{"reply":"好了"}')]
+        with patch("wxbot_framework.llm.urlopen", side_effect=responses) as call:
+            self.assertEqual(self.client.complete_json("JSON", "测试"), {"reply": "好了"})
+        self.assertEqual(call.call_count, 2)
+        repair = json.loads(call.call_args.args[0].data)["messages"]
+        self.assertEqual([row["role"] for row in repair[-2:]], ["assistant", "user"])
+
+    def test_broken_json_fails_after_a_single_repair(self):
+        with patch("wxbot_framework.llm.urlopen",
+                   side_effect=lambda *a, **k: self.response("还不是 JSON")) as call:
+            with self.assertRaisesRegex(LLMError, "补救"):
+                self.client.complete_json("JSON", "测试")
+        self.assertEqual(call.call_count, 2)
+
+    def test_auth_errors_are_not_retried(self):
+        error = HTTPError("https://example.com", 401, "dummy-test-key", {}, None)
+        with patch("wxbot_framework.llm.urlopen", side_effect=error) as call:
+            with self.assertRaisesRegex(LLMError, "密钥"):
+                self.client.complete_json("JSON", "测试")
+        self.assertEqual(call.call_count, 1)
+
+    def test_text_completion_needs_no_json_and_carries_real_roles(self):
+        with patch("wxbot_framework.llm.urlopen", return_value=self.response("直接说话的正文")) as call:
+            result = self.client.complete_text("系统", "当前", history=[{"role": "user", "content": "上一问"},
+                                                                    {"role": "assistant", "content": "上一答"}])
+        self.assertEqual(result, "直接说话的正文")
+        payload = json.loads(call.call_args.args[0].data)
+        self.assertNotIn("response_format", payload)
+        self.assertEqual([row["role"] for row in payload["messages"]],
+                         ["system", "user", "assistant", "user"])
 
 
 class JudgeTests(unittest.TestCase):

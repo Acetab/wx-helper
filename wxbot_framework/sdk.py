@@ -34,6 +34,9 @@ class Message:
     session_id: str = ""
     received_at: float = field(default_factory=time.monotonic)
     data: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    # 进程内接收序号；框架入口分配，原生 sequence 仍保留用于桥接诊断。
+    dispatch_sequence: int = 0
+    dispatch_epoch: str = ""
 
     @classmethod
     def from_native(cls, protocol, data, session_id):
@@ -161,7 +164,7 @@ class LegacyService:
 
 class PluginContext:
     def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None,
-                 knowledge_store=None, room_state_store=None):
+                 knowledge_store=None, room_state_store=None, display_timezone=None, message_watermarks=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -172,6 +175,16 @@ class PluginContext:
         self._members = member_store
         self._knowledge = knowledge_store
         self._room_state = room_state_store
+        self.display_timezone = display_timezone
+        self._message_watermarks = message_watermarks
+
+    def message_watermark(self, room):
+        """当前群已进入框架的最大接收序号，包含仍在落库或排队的消息。"""
+        return self._message_watermarks.latest(room) if self._message_watermarks is not None else 0
+
+    @property
+    def message_epoch(self):
+        return self._message_watermarks.epoch if self._message_watermarks is not None else ""
 
     @property
     def members(self):
@@ -188,7 +201,9 @@ class PluginContext:
     def knowledge(self):
         if self._knowledge is None:
             from .knowledge import KnowledgeStore
-            self._knowledge = KnowledgeStore(self.members)
+            self._knowledge = KnowledgeStore(
+                self.members,
+                display_timezone=(self.display_timezone or "Asia/Shanghai"))
             self._knowledge.initialize()
         return self._knowledge
 
@@ -202,7 +217,19 @@ class PluginContext:
         return self._llm
 
     def send_text(self, chat_id, text):
-        return self._service.send_text(chat_id, text)
+        sent = self._service.send_text(chat_id, text)
+        if sent:
+            self._record_bot_reply(chat_id, text)
+        return sent
+
+    def _record_bot_reply(self, chat_id, text):
+        """成功发出的机器人回复也进入聊天记录，供多轮对话引用自己的上一轮。"""
+        if self._members is None:
+            return
+        try:
+            self._members.record_bot_reply(chat_id, text)
+        except Exception:
+            self.logger.debug("机器人回复未能落库：chat_id=%s", chat_id)
 
     def personality(self, message):
         from .personality import PersonalityState
@@ -223,8 +250,11 @@ class PluginContext:
             yield
 
     def reply(self, message, text, *, delivery_guard=None):
-        return self._service.send_text(message.chat_id, text, expected_session=message.session_id,
+        sent = self._service.send_text(message.chat_id, text, expected_session=message.session_id,
                                        delivery_guard=delivery_guard)
+        if sent:
+            self._record_bot_reply(message.chat_id, text)
+        return sent
 
     def reply_at(self, message, text, *, display_name=None, delivery_guard=None):
         if not message.is_group:
@@ -235,7 +265,10 @@ class PluginContext:
                 display_name = member.display_name
             elif display_name is None:
                 display_name = self._members.wechat_name(message.sender_id)
-        return self._service.send_at_text(message.chat_id, text, [message.sender_id],
+        sent = self._service.send_at_text(message.chat_id, text, [message.sender_id],
                                          expected_session=message.session_id,
                                          display_names=[display_name] if display_name is not None else None,
                                          delivery_guard=delivery_guard)
+        if sent:
+            self._record_bot_reply(message.chat_id, text)
+        return sent

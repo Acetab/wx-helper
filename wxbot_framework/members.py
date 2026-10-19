@@ -17,6 +17,7 @@ from .config import validate_name
 from .text import validate_mentions
 from .commands import effective_text
 from .database import backup_before_migration
+from .timeutil import iso_utc, parse_utc
 
 
 class MemberError(ValueError):
@@ -69,6 +70,7 @@ class ConversationSnapshot:
     current: str
     group_messages: tuple = ()
     anchor_id: int = 0
+    history: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -276,8 +278,8 @@ class MemberStore:
     def _day_bounds(self):
         local = self._now().astimezone(BEIJING)
         start = local.replace(hour=0, minute=0, second=0, microsecond=0)
-        return (start.date().isoformat(), start.astimezone(timezone.utc).isoformat(),
-                (start + timedelta(days=1)).astimezone(timezone.utc).isoformat())
+        return (start.date().isoformat(), iso_utc(start),
+                iso_utc(start + timedelta(days=1)))
 
     def rollover(self):
         """即使没有新消息也可调用；停机期间跨天则在启动时补清理。"""
@@ -292,8 +294,9 @@ class MemberStore:
                         generation=chat_buffers.generation+? WHERE chat_buffers.local_day<>excluded.local_day""",
                                (self.account, room, day, int(self.daily_clear)))
                     if self.daily_clear:
-                        db.execute("DELETE FROM messages WHERE account=? AND room=? AND received_at<?",
-                                   (self.account, room, start))
+                        db.execute("""DELETE FROM messages WHERE account=? AND room=?
+                            AND replace(received_at,'+00:00','Z')<?""",
+                                   (self.account, room, iso_utc(start)))
             self._active_day = day
             return True
 
@@ -322,8 +325,9 @@ class MemberStore:
             if state is None:
                 raise MemberError("这个群尚未启用聊天记录")
             rows = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
-                AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id""",
-                              (self.account, room, member.wxid, start, end)).fetchall()
+                AND replace(received_at,'+00:00','Z')>=? AND replace(received_at,'+00:00','Z')<?
+                AND bot_generated=0 ORDER BY id""",
+                              (self.account, room, member.wxid, iso_utc(start), iso_utc(end))).fetchall()
             return ChatSnapshot(member, day, state[0], tuple(dict(row) for row in rows))
 
     def today_group_snapshot(self, room):
@@ -338,7 +342,8 @@ class MemberStore:
                                (self.account, room)).fetchone()
             rows = db.execute("""SELECT m.*, p.name AS speaker_name FROM messages m
                 LEFT JOIN people p ON p.account=m.account AND p.room=m.room AND p.wxid=m.sender_id
-                WHERE m.account=? AND m.room=? AND m.received_at>=? AND m.received_at<?
+                WHERE m.account=? AND m.room=?
+                AND replace(m.received_at,'+00:00','Z')>=? AND replace(m.received_at,'+00:00','Z')<?
                 AND m.bot_generated=0 ORDER BY m.id""", (self.account, room, start, end)).fetchall()
             speakers, messages = {}, []
             for row in rows:
@@ -392,12 +397,16 @@ class MemberStore:
             previous = self.recent_rows(message.chat_id, limit=10, sender_id=message.sender_id,
                                         before_id=anchor, context=True)
             group = self.recent_rows(message.chat_id, limit=group_limit, before_id=anchor, context=True)
+            # 真实收发顺序（含机器人自己的回复）用于多轮承接，30 分钟无新消息视为换话题。
+            history = self.recent_rows(message.chat_id, limit=40, before_id=anchor, context=True,
+                                       include_bot=True, continuity_seconds=1800)
             previous_ids = {row["id"] for row in previous}
             group = self.label_speakers([row for row in group if row["id"] not in previous_ids], message.chat_id)
+            history = self.label_speakers(history, message.chat_id)
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             return ConversationSnapshot(message.chat_id, day, state[0], member.name if member else
                                         self.safe_wechat_name(message.sender_id, message.chat_id) or "群友",
-                                        tuple(previous), message.text, tuple(group), anchor)
+                                        tuple(previous), message.text, tuple(group), anchor, tuple(history))
 
     @contextmanager
     def delivery_guard(self, snapshot):
@@ -621,7 +630,7 @@ class MemberStore:
         with self._lock:
             row = self._row(name, room)
             if row["person_key"] is None:
-                raise MemberError("请本人发送 /绑定 昵称 来设置本群称呼")
+                raise MemberError("未找到这个成员称呼，请联系管理员检查人物绑定")
             if row["wxid"] and row["wxid"] != wxid:
                 raise MemberError(f"{row['name']} 已绑定其他账号，未修改原绑定")
             other = self._connection().execute("SELECT name FROM people WHERE account=? AND room=? AND wxid=?",
@@ -684,16 +693,62 @@ class MemberStore:
             self.rollover()
             db.execute("INSERT OR IGNORE INTO room_members(account,room,wxid) VALUES(?,?,?)",
                        (self.account, message.chat_id, message.sender_id))
-            now = self._now().astimezone(timezone.utc).isoformat()
+            now = iso_utc(self._now())
+            if message.data.get("bot_generated"):
+                # 原生回显可能带 "@昵称 " 标签行或尾部空白；落库的是裸正文，几种形式都要比对。
+                variants = {message.text, message.text.strip()}
+                first, sep, rest = message.text.partition("\n")
+                if sep and first.startswith("@") and " " in first:
+                    variants.update((rest, rest.strip()))
+                echoes = [value for value in variants if value]
+                if echoes:
+                    placeholders = ",".join("?" for _ in echoes)
+                    cutoff = self._now() - timedelta(seconds=120)
+                    echo = db.execute(f"""SELECT 1 FROM messages WHERE account=? AND room=? AND bot_generated=1
+                        AND text IN ({placeholders}) AND replace(received_at,'+00:00','Z')>=? LIMIT 1""",
+                        (self.account, message.chat_id, *echoes, iso_utc(cutoff))).fetchone()
+                    if echo:
+                        return False
             db.execute("""UPDATE room_members SET first_seen=COALESCE(first_seen,?),last_seen=?
                 WHERE account=? AND room=? AND wxid=?""",
                        (now, now, self.account, message.chat_id, message.sender_id))
             result = db.execute("""INSERT OR IGNORE INTO messages
                 (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (self.account, message.chat_id, message.sender_id, message.text,
-                 self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
+                 now, message.session_id, message.sequence,
                  int(message.is_self), int(bool(message.data.get("bot_generated")))))
             return result.rowcount > 0
+
+    def record_bot_reply(self, room, text):
+        """把成功发出的机器人回复按真实时间落库，供多轮对话承接自己刚才的话。"""
+        if not self.history_enabled or room not in self.groups:
+            return False
+        if not isinstance(text, str) or not text.strip():
+            return False
+        with self._lock:
+            self.rollover()
+            with self._connection() as db:
+                moment = self._now()
+                now = iso_utc(moment)
+                # 原生回显可能先于这里落库；已有回显时不再补一条裸正文。
+                # 逐行取回再按去空白后的正文比对，避免尾部换行或 LIKE 通配符误判。
+                echoes = db.execute("""SELECT text FROM messages WHERE account=? AND room=?
+                    AND bot_generated=1 AND session_id<>'bot-reply'
+                    AND replace(received_at,'+00:00','Z')>=?""",
+                    (self.account, room, iso_utc(moment - timedelta(seconds=120)))).fetchall()
+                wanted = text.strip()
+                for row in echoes:
+                    candidate = row["text"].strip()
+                    first, sep, rest = candidate.partition("\n")
+                    if sep and first.startswith("@") and " " in first:
+                        candidate = rest.strip()
+                    if candidate == wanted:
+                        return False
+                result = db.execute("""INSERT INTO messages
+                    (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated)
+                    VALUES(?,?,?,?,?,?,0,1,1)""",
+                    (self.account, room, self.account, text.strip(), now, "bot-reply"))
+                return result.rowcount > 0
 
     def is_admin(self, wxid):
         from .authorization import LOCAL_EDITOR
@@ -712,25 +767,44 @@ class MemberStore:
             return self._connection().execute("SELECT COALESCE(MAX(id),0) FROM messages WHERE account=? AND room=?",
                                                (self.account, room)).fetchone()[0]
 
-    def recent_rows(self, room, *, limit=200, sender_id=None, before_id=None, since=None, until=None, context=False):
+    def recent_rows(self, room, *, limit=200, sender_id=None, before_id=None, since=None, until=None,
+                    context=False, include_bot=False, continuity_seconds=None):
         if room not in self.groups or type(limit) is not int or not 1 <= limit <= 5000:
             raise MemberError("查询需要已启用的群，条数应为 1—5000")
         with self._lock:
             self.rollover()
-            sql = "SELECT * FROM messages WHERE account=? AND room=? AND bot_generated=0"
+            sql = "SELECT * FROM messages WHERE account=? AND room=?"
+            if not include_bot:
+                sql += " AND bot_generated=0"
             values = [self.account, room]
-            for clause, value in (("sender_id=?", sender_id), ("id<?", before_id),
-                                  ("received_at>=?", since), ("received_at<?", until)):
-                if value is not None:
-                    sql += " AND " + clause
-                    values.append(value)
+            if sender_id is not None:
+                sql += " AND sender_id=?"
+                values.append(sender_id)
+            if before_id is not None:
+                sql += " AND id<?"
+                values.append(before_id)
+            if since is not None:
+                sql += " AND replace(received_at,'+00:00','Z')>=?"
+                values.append(iso_utc(since))
+            if until is not None:
+                sql += " AND replace(received_at,'+00:00','Z')<?"
+                values.append(iso_utc(until))
             if context:
                 floor = self._connection().execute("SELECT context_floor FROM chat_buffers WHERE account=? AND room=?",
                                                    (self.account, room)).fetchone()[0]
                 sql += " AND id>?"
                 values.append(floor)
-            rows = []
+            rows, newest = [], None
             for row in self._connection().execute(sql + " ORDER BY id DESC", values):
+                if continuity_seconds is not None:
+                    try:
+                        stamp = parse_utc(row["received_at"])
+                    except (TypeError, ValueError):
+                        stamp = None
+                    if newest is not None and stamp is not None and (newest - stamp).total_seconds() > continuity_seconds:
+                        break
+                    if stamp is not None:
+                        newest = stamp
                 if effective_text(row["text"]):
                     rows.append(dict(row))
                     if len(rows) >= limit:
@@ -776,13 +850,13 @@ class MemberStore:
         if self.find_by_wxid(wxid, room) is not None:
             return False
         with self._lock, self._connection() as db:
-            now = self._now().astimezone(timezone.utc)
+            now = parse_utc(self._now())
             row = db.execute("SELECT reminded_at FROM binding_reminders WHERE account=? AND room=? AND wxid=?",
                              (self.account, room, wxid)).fetchone()
-            if row and now - datetime.fromisoformat(row[0]) < timedelta(days=7):
+            if row and now - parse_utc(row[0]) < timedelta(days=7):
                 return False
             db.execute("INSERT OR REPLACE INTO binding_reminders VALUES(?,?,?,?)",
-                       (self.account, room, wxid, now.isoformat()))
+                       (self.account, room, wxid, iso_utc(now)))
             return True
 
     def history(self, name, room=None, *, limit=100, since=None):
@@ -791,7 +865,7 @@ class MemberStore:
         if since is not None:
             if not isinstance(since, datetime) or since.tzinfo is None or since.utcoffset() is None:
                 raise MemberError("since 应为带时区的 datetime")
-            since = since.astimezone(timezone.utc).isoformat()
+            since = iso_utc(since)
         with self._lock:
             self.rollover()
             member = self.resolve(name, room)
@@ -800,8 +874,8 @@ class MemberStore:
             sql = "SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?"
             values = [self.account, member.room, member.wxid]
             if since is not None:
-                sql += " AND received_at>=?"
-                values.append(since)
+                sql += " AND replace(received_at,'+00:00','Z')>=?"
+                values.append(iso_utc(since))
             rows = self._connection().execute(sql + " ORDER BY id DESC LIMIT ?", [*values, limit]).fetchall()
             return [dict(row) for row in reversed(rows)]
 

@@ -17,6 +17,24 @@ from wxbot_framework.knowledge import KnowledgeStore
 from wxbot_framework.members import MemberStore
 from wxbot_framework.locking import InstanceLock
 from wxbot_framework.maintenance import maintenance_options
+from wxbot_framework.timeutil import DEFAULT_DISPLAY_TIMEZONE
+
+HOURLY_DEFAULTS = {
+    "enabled": True,
+    "start_hour": 9,
+    "end_hour": 23,
+    "evening_start_hour": 18,
+    "active_min_minutes": 120,
+    "active_max_minutes": 180,
+    "evening_min_minutes": 180,
+    "evening_max_minutes": 300,
+    "activity_window_minutes": 180,
+    "daily_limit": 6,
+    "cooldown_minutes": 45,
+    "min_messages": 2,
+    "min_speakers": 2,
+    "context_limit": 200,
+}
 
 
 def save_config(path, data):
@@ -54,14 +72,15 @@ def _migrate_locked(config_path):
     members_data.setdefault("owner_wxid", None)
     config.setdefault("memory", {"enabled": True, "batch_size": 50, "flush_seconds": 600,
                                  "seed_file": ".runtime/group_knowledge_seed.json"})
-    config.setdefault("hourly_chat", {"enabled": True, "start_hour": 9, "end_hour": 23, "context_limit": 200})
+    config.setdefault("display_timezone", DEFAULT_DISPLAY_TIMEZONE)
+    config.setdefault("hourly_chat", dict(HOURLY_DEFAULTS))
     config.setdefault("plugins", {}).setdefault("knowledge", {})["enabled"] = True
     save_config(members_path, members_data)
     save_config(config_path, config)
     members = MemberStore.from_config(config, config_path.parent)
     try:
         members.initialize()
-        knowledge = KnowledgeStore(members)
+        knowledge = KnowledgeStore(members, display_timezone=config["display_timezone"])
         upgrade = maintenance_options(config)["upgrade_file"]
         knowledge.initialize(config_path.parent / config["memory"]["seed_file"],
                              upgrade_file=config_path.parent / upgrade if upgrade else None)

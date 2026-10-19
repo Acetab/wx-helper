@@ -88,10 +88,12 @@ class Plugin:
                 relevant = []
             else:
                 relevant = ctx.knowledge.search(message.chat_id, clean_query, limit=4, char_limit=2000)
+            people = ctx.knowledge.lookup_people(message.chat_id, clean_query)
             knowledge = list({item["id"]: item for item in own + relevant}.values())
             style = ctx.knowledge.style(message.chat_id, message.sender_id)
             reply = personality_text(Dialogue(ctx.llm_for(message, personality=personality)).reply(snapshot,
                                      knowledge=knowledge, style=style, speaker_profile=profile,
+                                     people=people,
                                      room_game=self.game_context(game) if game else None),
                                      personality.name)
             display = self.members.at_display_name(message.sender_id, message.chat_id) or snapshot.speaker_name

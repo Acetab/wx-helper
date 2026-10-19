@@ -30,6 +30,8 @@ class ConfigStore:
     def validate(self, data):
         if not isinstance(data, dict):
             raise ValueError("配置文件必须是 JSON 对象")
+        from .timeutil import DEFAULT_DISPLAY_TIMEZONE, validate_display_timezone
+        validate_display_timezone(data.get("display_timezone", DEFAULT_DISPLAY_TIMEZONE))
         from .feature_config import feature_options
         feature_options(data)
         from .maintenance import maintenance_options

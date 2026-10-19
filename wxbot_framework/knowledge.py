@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 
 from .members import MemberError, name_key, parse_aliases, parse_json_list
@@ -12,8 +12,16 @@ from .memory_schema import initialize_schema
 from .commands import effective_text
 from .knowledge_admin import KnowledgeAdminMixin
 from .authorization import editor_label
+from .timeutil import iso_utc
 
 KINDS = frozenset({"人工确认", "本人陈述", "他人提及", "群内玩笑", "存在争议", "语言习惯"})
+GROUP_KEY = "group:本群"
+GROUP_NAME = "本群"
+# 群级公共记忆的自动沉淀门槛：至少 3 条去重原始消息，且来自 2 位不同成员。
+GROUP_EVIDENCE_MESSAGES = 3
+GROUP_EVIDENCE_SPEAKERS = 2
+# 候选公共记忆 30 天没有新增有效证据后归档，内容与来源保留，管理员可恢复。
+CANDIDATE_IDLE_DAYS = 30
 
 
 def sanitized(value, limit=600):
@@ -61,10 +69,11 @@ def read_seed(path):
 
 
 class KnowledgeStore(KnowledgeAdminMixin):
-    def __init__(self, members):
+    def __init__(self, members, *, display_timezone=None):
         self.members = members
         self.account = members.account
         self._lock = members._lock
+        self.display_timezone = display_timezone or "Asia/Shanghai"
 
     def initialize(self, seed_file=None, *, upgrade_file=None):
         with self._lock:
@@ -98,14 +107,18 @@ class KnowledgeStore(KnowledgeAdminMixin):
         return self.members._connection()
 
     def now(self):
-        return self.members._now().astimezone(timezone.utc).isoformat()
+        return iso_utc(self.members._now())
 
     def _room(self, room):
         if room not in self.members.groups:
             raise MemberError("这个群尚未启用知识库")
 
-    def entity(self, room, name, *, aliases=(), pinned=False):
+    def entity(self, room, name, *, aliases=(), pinned=False, reactivate=True):
+        """人物档案只在管理员确认后建档；自动提炼、随口提及都不再自动创建。"""
         self._room(room)
+        if name_key(name) == name_key(GROUP_NAME):
+            # 「本群」永远落在群公共记忆主体，不再生成 person:本群。
+            return self.group_entity(room)
         key = "person:" + name_key(name)
         clean = sorted({name_key(alias) for alias in aliases if len(alias.strip()) >= 2})
         with self._lock, self._db() as db:
@@ -117,6 +130,11 @@ class KnowledgeStore(KnowledgeAdminMixin):
                 if len(matches) == 1:
                     existing = matches[0]
                     key = existing["entity_key"]
+            if existing is None and not pinned:
+                raise MemberError("人物档案只能由管理员确认绑定后创建；随手提到的名字不会自动建档")
+            if existing and existing["status"] == "quarantined" and not reactivate:
+                # 隔离人物不接受种子或自动流程的改写；只能由管理员显式恢复。
+                return dict(existing)
             if existing and existing["aliases_manual"]:
                 clean = parse_aliases(existing["aliases"])
             if existing:
@@ -125,14 +143,61 @@ class KnowledgeStore(KnowledgeAdminMixin):
                 clean = [alias for alias in clean if alias not in blocked]
             self.assert_person_names(room, name, clean, existing["id"] if existing else None)
             db.execute("""INSERT OR IGNORE INTO knowledge_entities
-                (account,room,entity_key,name,aliases,pinned) VALUES(?,?,?,?,?,?)""",
+                (account,room,entity_key,name,aliases,pinned,status) VALUES(?,?,?,?,?,?,'active')""",
                 (self.account, room, key, name.strip(), json.dumps(clean, ensure_ascii=False), int(pinned)))
             row = db.execute("SELECT * FROM knowledge_entities WHERE account=? AND room=? AND entity_key=?",
                              (self.account, room, key)).fetchone()
             merged = sorted(set(parse_aliases(row["aliases"])) | set(clean))
-            db.execute("UPDATE knowledge_entities SET aliases=?,pinned=MAX(pinned,?) WHERE id=?",
-                       (json.dumps(merged, ensure_ascii=False), int(pinned), row["id"]))
+            db.execute("""UPDATE knowledge_entities SET aliases=?,pinned=MAX(pinned,?),
+                status=CASE WHEN ? OR status<>'quarantined' THEN 'active' ELSE status END WHERE id=?""",
+                (json.dumps(merged, ensure_ascii=False), int(pinned), int(reactivate), row["id"]))
             return dict(db.execute("SELECT * FROM knowledge_entities WHERE id=?", (row["id"],)).fetchone())
+
+    def group_entity(self, room):
+        """本群公共记忆主体；与人物档案分离，避免混入人物列表。"""
+        self._room(room)
+        with self._lock, self._db() as db:
+            row = db.execute("SELECT * FROM knowledge_entities WHERE account=? AND room=? AND entity_key=?",
+                             (self.account, room, GROUP_KEY)).fetchone()
+            if row is None:
+                db.execute("""INSERT OR IGNORE INTO knowledge_entities
+                    (account,room,entity_key,name,aliases,pinned,status) VALUES(?,?,?,?,'[]',1,'active')""",
+                    (self.account, room, GROUP_KEY, GROUP_NAME))
+                row = db.execute("SELECT * FROM knowledge_entities WHERE account=? AND room=? AND entity_key=?",
+                                 (self.account, room, GROUP_KEY)).fetchone()
+            return dict(row)
+
+    def resolve_person(self, room, name):
+        """只在已建档案里查；找不到或同名歧义都返回 None，绝不新建。"""
+        key = name_key(name)
+        with self._lock:
+            self._room(room)
+            matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and
+                       e["status"] == "active" and key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
+            return matches[0] if len(matches) == 1 else None
+
+    def person_profile(self, room, entity):
+        """给其他成员的姓名查询使用：返回可核对的身份信息。"""
+        wxid = entity["wxid"]
+        return {"name": entity["name"], "aliases": parse_aliases(entity["aliases"]), "bound": bool(wxid),
+                "wechat_name": self.members.wechat_name(wxid) if wxid else None}
+
+    def lookup_people(self, room, text, *, limit=3):
+        """从当前提问里找出被提到的已建档人物，供其他成员按姓名查询身份。"""
+        self._room(room)
+        query = (text or "").casefold()
+        if not query:
+            return []
+        with self._lock:
+            found = []
+            for entity in self._entities(room):
+                if entity["status"] != "active" or not entity["entity_key"].startswith("person:"):
+                    continue
+                names = [entity["name"], *parse_aliases(entity["aliases"])]
+                if any(len(name) >= 2 and name.casefold() in query for name in names):
+                    found.append(entity)
+            found.sort(key=lambda item: (not bool(item["wxid"]), len(item["name"])))
+            return [self.person_profile(room, entity) for entity in found[:limit]]
 
     def member_entity(self, room, wxid):
         self._room(room)
@@ -151,8 +216,8 @@ class KnowledgeStore(KnowledgeAdminMixin):
             if not seen:
                 raise MemberError("这个成员还没有在本群留下记录")
             name = self.members.display_name(wxid, room) or "未绑定成员"
-            db.execute("""INSERT INTO knowledge_entities(account,room,entity_key,name,wxid)
-                VALUES(?,?,?,?,?)""", (self.account, room, "member:" + wxid, name, wxid))
+            db.execute("""INSERT INTO knowledge_entities(account,room,entity_key,name,wxid,status)
+                VALUES(?,?,?,?,?,'active')""", (self.account, room, "member:" + wxid, name, wxid))
             return dict(db.execute("SELECT * FROM knowledge_entities WHERE account=? AND room=? AND wxid=?",
                                    (self.account, room, wxid)).fetchone())
 
@@ -164,7 +229,10 @@ class KnowledgeStore(KnowledgeAdminMixin):
         key = name_key(name)
         with self._lock:
             self._room(room)
-            matches = [e for e in self._entities(room) if key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
+            if key == name_key(GROUP_NAME):
+                return self.group_entity(room)
+            matches = [e for e in self._entities(room) if e["status"] == "active" and
+                       key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
             # 明确绑定的称呼优先作为成员查询；不据此关联同名空间人物。
             try:
                 member = self.members.resolve(name, room)
@@ -182,7 +250,7 @@ class KnowledgeStore(KnowledgeAdminMixin):
         with self._lock:
             self._room(room)
             matches = [e for e in self._entities(room) if e["entity_key"].startswith("person:") and
-                       key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
+                       e["status"] == "active" and key in {name_key(e["name"]), *parse_aliases(e["aliases"])}]
             if len(matches) != 1:
                 raise MemberError("未找到唯一人物")
             return matches[0]
@@ -280,6 +348,8 @@ class KnowledgeStore(KnowledgeAdminMixin):
                             (entity_id, self.account, room)).fetchone()
         if not entity:
             raise MemberError("知识人物不属于当前群")
+        if entity["status"] == "quarantined":
+            return None
         if expected_epoch is not None and entity["epoch"] != expected_epoch:
             return None
         if origin and origin.startswith("seed:") and entity["epoch"]:
@@ -295,20 +365,65 @@ class KnowledgeStore(KnowledgeAdminMixin):
             if old["content"] != content and old["kind"] != "语言习惯":
                 slot = slot[:60] + "#" + hashlib.sha256(content.encode()).hexdigest()[:10]
                 kind = "存在争议" if kind != "群内玩笑" else kind
-        db.execute("""INSERT INTO knowledge_items(account,room,entity_id,slot,kind,content,tags,updated_at,epoch)
-            VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(account,room,entity_id,epoch,slot) DO UPDATE SET
+        # 群级自动记忆先落候选，攒够跨成员证据才对外生效；已生效的旧条目不会被重新降级。
+        status = "candidate" if entity["entity_key"].startswith("group:") else "active"
+        now = self.now()
+        db.execute("""INSERT INTO knowledge_items(account,room,entity_id,slot,kind,content,tags,updated_at,epoch,status)
+            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,room,entity_id,epoch,slot) DO UPDATE SET
             content=excluded.content,tags=excluded.tags,updated_at=excluded.updated_at,
             revision=knowledge_items.revision+1 WHERE knowledge_items.manual=0 AND knowledge_items.status='active'
             AND (knowledge_items.content<>excluded.content OR knowledge_items.tags<>excluded.tags)""",
-            (self.account, room, entity_id, slot, kind, content, json.dumps(tags, ensure_ascii=False), self.now(), entity["epoch"]))
+            (self.account, room, entity_id, slot, kind, content, json.dumps(tags, ensure_ascii=False), now,
+             entity["epoch"], status))
         item_id = db.execute("SELECT id FROM knowledge_items WHERE account=? AND room=? AND entity_id=? AND epoch=? AND slot=?",
                              (self.account, room, entity_id, entity["epoch"], slot)).fetchone()[0]
+        added_message = False
         for source in sources:
-            db.execute("INSERT OR IGNORE INTO knowledge_sources VALUES(?,?,?,?,?)",
-                       (item_id, "message:" + str(source["id"]), source["id"], source["sender_id"], source["received_at"]))
+            added_message = db.execute("INSERT OR IGNORE INTO knowledge_sources VALUES(?,?,?,?,?)",
+                                       (item_id, "message:" + str(source["id"]), source["id"], source["sender_id"],
+                                        source["received_at"])).rowcount > 0 or added_message
         if origin:
-            db.execute("INSERT OR IGNORE INTO knowledge_sources VALUES(?,?,NULL,NULL,?)", (item_id, origin, self.now()))
+            db.execute("INSERT OR IGNORE INTO knowledge_sources VALUES(?,?,NULL,NULL,?)", (item_id, origin, now))
+        if entity["entity_key"].startswith("group:"):
+            if added_message:
+                # 新证据就是一次“活动”：刷新归档计时，并让已归档候选重新参与晋升。
+                db.execute("""UPDATE knowledge_items SET updated_at=?,revision=revision+1,
+                    status=CASE WHEN status='archived' THEN 'candidate' ELSE status END
+                    WHERE id=? AND status IN ('candidate','archived')""", (now, item_id))
+            self._refresh_group_item(db, item_id)
         return item_id
+
+    def _refresh_group_item(self, db, item_id):
+        """群级自动记忆只有攒够跨成员证据才对外可见，否则留在候选中。"""
+        row = db.execute("SELECT manual,status FROM knowledge_items WHERE id=?", (item_id,)).fetchone()
+        if row is None or row["status"] != "candidate":
+            return
+        messages, speakers = self.group_evidence(db, item_id)
+        if messages >= GROUP_EVIDENCE_MESSAGES and speakers >= GROUP_EVIDENCE_SPEAKERS:
+            db.execute("UPDATE knowledge_items SET status='active' WHERE id=?", (item_id,))
+
+    @staticmethod
+    def group_evidence(db, item_id):
+        """去重原始消息数与参与成员数；机器人回复与同一句复读都不计入。"""
+        rows = db.execute("""SELECT message_id,speaker_id FROM knowledge_sources
+            WHERE item_id=? AND message_id IS NOT NULL""", (item_id,)).fetchall()
+        messages, speakers = set(), set()
+        for row in rows:
+            messages.add(row["message_id"])
+            speakers.add(row["speaker_id"])
+        return len(messages), len(speakers)
+
+    def archive_stale_candidates(self, room, *, days=CANDIDATE_IDLE_DAYS):
+        """候选公共记忆长期没有新增有效证据后归档，内容和来源保留。"""
+        self._room(room)
+        cutoff = iso_utc(self.members._now() - timedelta(days=days))
+        with self._lock, self._db() as db:
+            rows = db.execute("""SELECT id FROM knowledge_items WHERE account=? AND room=?
+                AND status='candidate' AND replace(updated_at,'+00:00','Z')<?""",
+                (self.account, room, cutoff)).fetchall()
+            for row in rows:
+                db.execute("UPDATE knowledge_items SET status='archived',revision=revision+1 WHERE id=?", (row["id"],))
+            return len(rows)
 
     def import_seed(self, path):
         data = read_seed(path)
@@ -327,14 +442,22 @@ class KnowledgeStore(KnowledgeAdminMixin):
                         continue
                     claimed_elsewhere.update(row_names)
                 seed_aliases = [alias for alias in profile.get("aliases", []) if name_key(alias) not in claimed_elsewhere]
-                entity = self.entity(room, profile["name"], aliases=seed_aliases, pinned=True)
+                entity = self.entity(room, profile["name"], aliases=seed_aliases, pinned=True, reactivate=False)
+                if entity.get("status") == "quarantined":
+                    continue
                 with self._lock, self._db():
                     for entry in profile.get("memories", []):
                         kind = entry.get("kind", "群内玩笑")
                         item_id = self.put(room, entity["id"], entry["key"], kind, entry["content"],
                                            tags=entry.get("tags", []), origin="seed:" + digest + ":" + entry["key"])
-                        if item_id:
-                            self._db().execute("UPDATE knowledge_items SET manual=1 WHERE id=?", (item_id,))
+                        if not item_id:
+                            continue
+                        # 种子是管理员维护的内容，但不得覆盖 /忘记 或已归档的人工结果。
+                        row = self._db().execute("SELECT manual,status FROM knowledge_items WHERE id=?",
+                                                 (item_id,)).fetchone()
+                        if row and not row["manual"] and row["status"] not in ("forgotten", "archived"):
+                            self._db().execute("UPDATE knowledge_items SET manual=1,status='active' WHERE id=?",
+                                               (item_id,))
 
     def cursor(self, room):
         self._room(room)
@@ -368,6 +491,8 @@ class KnowledgeStore(KnowledgeAdminMixin):
 
     def visible(self, entity):
         with self._lock:
+            if entity.get("status") == "quarantined":
+                return False
             if entity["pinned"] or entity["wxid"]:
                 return True
             row = self._db().execute("SELECT COUNT(*),COUNT(DISTINCT speaker_id) FROM knowledge_mentions WHERE entity_id=? AND message_id>?",
@@ -390,7 +515,7 @@ class KnowledgeStore(KnowledgeAdminMixin):
             for row in self._db().execute("SELECT * FROM knowledge_items WHERE account=? AND room=? AND status='active'",
                                          (self.account, room)):
                 entity = entities.get(row["entity_id"])
-                if entity is None or row["epoch"] != entity["epoch"]:
+                if entity is None or entity["status"] != "active" or row["epoch"] != entity["epoch"]:
                     continue
                 if not self.visible(entity) or (entity_id is not None and entity["id"] != entity_id):
                     continue
@@ -405,10 +530,11 @@ class KnowledgeStore(KnowledgeAdminMixin):
                     score += 1
                 if score:
                     item = dict(row)
-                    if entity["entity_key"].startswith("person:"):
+                    if entity["entity_key"].startswith(("person:", "group:")):
                         item["name"] = entity["name"]
                     else:
                         item["name"] = (self.members.display_name(entity["wxid"], room) if entity["wxid"] else None) or entity["name"]
+                    item["scope"] = "group" if entity["entity_key"].startswith("group:") else "person"
                     item["sources"] = [dict(source) for source in self._db().execute(
                         "SELECT origin,message_id,source_time FROM knowledge_sources WHERE item_id=? ORDER BY source_time DESC LIMIT 3",
                         (row["id"],))]
@@ -458,6 +584,8 @@ class KnowledgeStore(KnowledgeAdminMixin):
         with self._lock:
             context = []
             for entity in self._entities(room):
+                if entity["status"] == "quarantined":
+                    continue
                 if entity["wxid"] and entity["wxid"] not in speakers:
                     if not entity["pinned"]:
                         continue
@@ -475,5 +603,9 @@ class KnowledgeStore(KnowledgeAdminMixin):
         with self._lock:
             return {"active_memories": self._db().execute("SELECT COUNT(*) FROM knowledge_items WHERE account=? AND status='active'",
                                                          (self.account,)).fetchone()[0],
+                    "candidate_memories": self._db().execute("SELECT COUNT(*) FROM knowledge_items WHERE account=? AND status='candidate'",
+                                                            (self.account,)).fetchone()[0],
+                    "quarantined_people": self._db().execute("""SELECT COUNT(*) FROM knowledge_entities
+                        WHERE account=? AND status='quarantined'""", (self.account,)).fetchone()[0],
                     "learning": [dict(row) for row in self._db().execute(
                         "SELECT room,cursor_id,updated_at,last_error FROM memory_cursors WHERE account=?", (self.account,))]}

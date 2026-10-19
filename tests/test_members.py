@@ -197,6 +197,52 @@ class MemberTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_at_reply_echo_is_not_recorded_twice(self):
+        self.store.bind("成员乙", ROOM, JING)
+        backend = Mock(session_id="first")
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        try:
+            ctx = PluginContext("example", {}, service, [], member_store=self.store)
+            ctx.reply_at(self.message(), "回复")
+            self.store.record(self.message("@成员乙群名 \n回复", sender=ROBOT, is_self=True, sequence=2,
+                                          data={"bot_generated": True}))
+            rows = self.store.recent_rows(ROOM, limit=10, include_bot=True)
+            self.assertEqual([row["text"] for row in rows], ["回复"])
+        finally:
+            service.close()
+
+    def test_echo_recorded_before_bot_reply_is_not_duplicated(self):
+        self.store.bind("成员乙", ROOM, JING)
+        backend = Mock(session_id="first")
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        try:
+            ctx = PluginContext("example", {}, service, [], member_store=self.store)
+            # 原生回显先落库，插件线程稍后才补记机器人回复：不能留下第二条裸正文。
+            self.store.record(self.message("@成员乙群名 \n回复", sender=ROBOT, is_self=True, sequence=2,
+                                          data={"bot_generated": True}))
+            ctx.reply_at(self.message(), "回复")
+            rows = self.store.recent_rows(ROOM, limit=10, include_bot=True)
+            self.assertEqual([row["text"] for row in rows], ["@成员乙群名 \n回复"])
+        finally:
+            service.close()
+
+    def test_echo_with_trailing_whitespace_is_not_duplicated(self):
+        self.store.bind("成员乙", ROOM, JING)
+        backend = Mock(session_id="first")
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        try:
+            ctx = PluginContext("example", {}, service, [], member_store=self.store)
+            self.store.record(self.message("@成员乙群名 \n回复\n", sender=ROBOT, is_self=True, sequence=2,
+                                          data={"bot_generated": True}))
+            ctx.reply_at(self.message(), "回复\n")
+            rows = self.store.recent_rows(ROOM, limit=10, include_bot=True)
+            self.assertEqual([row["text"] for row in rows], ["@成员乙群名 \n回复\n"])
+        finally:
+            service.close()
+
     def test_runtime_archives_before_plugin_dispatch(self):
         (self.root / "plugins").mkdir()
         path = self.root / "bot_config.json"

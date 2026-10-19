@@ -67,10 +67,11 @@ def main():
                     if app.maintenance is None:
                         raise ValueError("维护目标需要成员目录")
                     app.maintenance.room()
-                if app.maintenance_options["announcement"]:
+                if app.maintenance_options["announcements"]:
                     if app.maintenance is None:
                         raise ValueError("更新公告需要成员目录")
-                    app.maintenance.room(explicit=app.maintenance_options["announcement"]["room"])
+                    for notice in app.maintenance_options["announcements"]:
+                        app.maintenance.room(explicit=notice["room"])
             specs = app.plugins.discover()
             if app.plugins.load_errors:
                 raise ValueError(str(app.plugins.load_errors))
