@@ -1,9 +1,11 @@
-"""休闲接龙的常用成语池；只约束机器人出题，不作为玩家答案的全集。
+"""扩展接龙词库与常用接法分开：扩大出题范围，保留容易接的落脚字。
 
 词条为项目维护的简体四字成语清单，不包含复制的词典释义。
 新增词条时需同时检查真实性、常用程度以及首尾衔接。
 """
 from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
 import random
 
 WORDS = """
@@ -208,22 +210,43 @@ WORDS = """
 """.split()
 
 
+@lru_cache(maxsize=1)
+def dictionary_words():
+    """发布包内置的固定版本词表；运行时不下载，也不依赖模型补词。"""
+    return frozenset(Path(__file__).with_name("data").joinpath("idioms.txt").read_text(
+        encoding="utf-8").split())
+
+
 class Lexicon:
-    def __init__(self, words=WORDS, *, rng=None):
-        self.words = frozenset(words)
+    def __init__(self, words=None, *, common_words=None, rng=None):
+        # 显式传入小词表时保持独立，便于测试和自定义词库。
+        supplied = words is not None
+        self.words = frozenset(words) if supplied else dictionary_words() | frozenset(WORDS)
+        self.common_words = self.words & frozenset(
+            common_words if common_words is not None else self.words if supplied else WORDS)
         self.by_first = defaultdict(list)
+        self.common_by_first = defaultdict(list)
         for word in sorted(self.words):
             self.by_first[word[0]].append(word)
+            if word in self.common_words:
+                self.common_by_first[word[0]].append(word)
         self.rng = rng or random.Random()
 
     def continuations(self, previous, used):
         blocked = set(used) | {previous}
         return [word for word in self.by_first.get(previous[-1], ()) if word not in blocked]
 
+    def suggestions(self, previous, used):
+        """提示和参考答案先显示常用词，避免大词库的字典序把生僻词排在前面。"""
+        choices = self.continuations(previous, used)
+        return sorted(choices, key=lambda word: (word not in self.common_words, word))
+
     def playable(self, words, used, minimum=3):
         blocked = set(used)
+        counts = {char: sum(word not in blocked for word in entries)
+                  for char, entries in self.common_by_first.items()}
         return [word for word in words if word not in blocked and
-                len(self.continuations(word, blocked | {word})) >= minimum]
+                counts.get(word[-1], 0) - int(word in self.common_words and word[0] == word[-1]) >= minimum]
 
     def choose(self, previous, used, minimum=3):
         """优先留足 minimum 个接法；不足时逐级放宽到 1，避免把可接的题判成死路。"""
@@ -234,21 +257,30 @@ class Lexicon:
                 return self._choose_sustainable(options, used, floor)
         return ""
 
-    def opening(self, minimum=3):
+    def opening(self, minimum=3, *, used=()):
         for floor in range(minimum, 0, -1):
-            candidates = self.playable(sorted(self.words), (), floor)
+            candidates = self.playable(sorted(self.words), used, floor)
             if candidates:
-                return self._choose_sustainable(candidates, (), floor)
-        raise ValueError("常用词池没有可接续的开场成语")
+                return self._choose_sustainable(candidates, used, floor)
+        raise ValueError("词库没有留有常用接法的开场成语")
 
     def _choose_sustainable(self, candidates, used, minimum):
-        """优先保留能继续来回接的答案；玩家仍可用合法绝杀词获胜。"""
+        """以常用接法估计后续可玩性；按首尾字聚合，避免大词库逐词多层扫描。"""
+        blocked = set(used)
+        replies_by_first = {char: [word for word in entries if word not in blocked]
+                            for char, entries in self.common_by_first.items()}
+        sustainable_starts = {word[0] for word in self.playable(self.words, blocked, minimum)}
+        # 这是选词偏好，不是后续所有路径的保证；真正出题仍逐次检查未使用的常用接法。
+        ratios = {}
+        for char, replies in replies_by_first.items():
+            ratios[char] = sum(reply[-1] in sustainable_starts for reply in replies) / len(replies) if replies else 0
         scored = []
         for word in candidates:
-            blocked = set(used) | {word}
-            replies = self.continuations(word, blocked)
-            viable = sum(bool(self.playable(self.continuations(reply, blocked | {reply}),
-                                           blocked | {reply}, minimum)) for reply in replies)
-            scored.append((viable / len(replies), word))
+            scored.append((ratios.get(word[-1], 0), word))
         best = max(score for score, _ in scored)
-        return self.rng.choice([word for score, word in scored if score >= best - 0.1])
+        options = [word for score, word in scored if score >= best - 0.1]
+        common = [word for word in options if word in self.common_words]
+        expanded = [word for word in options if word not in self.common_words]
+        # 熟词仍占多数，也让新增词条能出场；熟词接不上时可直接使用扩展词库。
+        pool = common if common and (not expanded or self.rng.random() < 0.75) else expanded
+        return self.rng.choice(pool)

@@ -160,6 +160,8 @@ class JudgeTests(unittest.TestCase):
                 self.assertEqual(len(self.client.calls), 0)
 
     def test_unknown_answer_sends_only_candidate_to_model(self):
+        from plugins.idiom_chain.lexicon import Lexicon
+        self.judge.lexicon = Lexicon(("声东击西", "西装革履", "西风残照"))
         used = ("万事如意", "意有所指", "指日可待", "待人接物", "物是人非", "非同小可", "可歌可泣")
         result = self.judge.evaluate("可歌可泣", "泣不成声", used)
         self.assertTrue(result.accepted)
@@ -175,6 +177,8 @@ class JudgeTests(unittest.TestCase):
         self.client.complete_json.assert_not_called()
 
     def test_unknown_answer_model_errors_are_not_a_game_loss(self):
+        from plugins.idiom_chain.lexicon import Lexicon
+        self.judge.lexicon = Lexicon(("声东击西", "西装革履", "西风残照"))
         self.client.complete_json = Mock(side_effect=LLMError("测试超时"))
         with self.assertRaises(LLMError):
             self.judge.evaluate("可歌可泣", "泣不成声", ())
@@ -184,6 +188,8 @@ class JudgeTests(unittest.TestCase):
                 self.judge.evaluate("可歌可泣", "泣不成声", ())
 
     def test_model_boolean_is_strict(self):
+        from plugins.idiom_chain.lexicon import Lexicon
+        self.judge.lexicon = Lexicon(("声东击西", "西装革履", "西风残照"))
         self.client.result["is_idiom"] = "true"
         with self.assertRaises(LLMError):
             self.judge.evaluate("可歌可泣", "泣不成声", ())

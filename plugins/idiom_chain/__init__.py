@@ -223,9 +223,9 @@ class Plugin:
             if game.hints_left == 0:
                 ctx.reply(message, "本局两次提示已经用完，还可以试试“接龙换题”。", delivery_guard=guard)
                 return
-            choices = judge.lexicon.continuations(current, used)
+            choices = judge.lexicon.suggestions(current, used)
             if not choices:
-                ctx.reply(message, "常用词池里没有可用提示，可以换题或发送“接龙认输”结束本局。", delivery_guard=guard)
+                ctx.reply(message, "本地词库里没有可用提示，可以换题或发送“接龙认输”结束本局。", delivery_guard=guard)
                 return
             word = game.hint_word if game.hint_word in choices else choices[0]
             mask = word[:2] + "□" + word[-1] if game.hint_word == word else word[0] + "□□" + word[-1]
@@ -239,10 +239,10 @@ class Plugin:
             if game.last_player:
                 word = judge.lexicon.choose(game.last_player, used, MIN_FOLLOWUPS)
             elif len(used) == 1:
-                options = judge.lexicon.playable(sorted(judge.lexicon.words), used, MIN_FOLLOWUPS)
-                if not options:
-                    options = judge.lexicon.playable(sorted(judge.lexicon.words), used, 1)
-                word = judge.lexicon.rng.choice(options) if options else ""
+                try:
+                    word = judge.lexicon.opening(MIN_FOLLOWUPS, used=used)
+                except ValueError:
+                    word = ""
             else:
                 word = ""
             if not word:
@@ -267,7 +267,7 @@ class Plugin:
             response = "已退出接龙。" if text == "退出接龙" else "本局结束，下局再战！"
             if game:
                 response += f"\n本局接对 {game.rounds}/{game.goal} 次，{len(game.scores)} 人参与。"
-                examples = judge.lexicon.continuations(game.chain.current, game.chain.used)[:2]
+                examples = judge.lexicon.suggestions(game.chain.current, game.chain.used)[:2]
                 if text == "接龙认输" and examples:
                     response += "\n刚才可以接：" + "、".join(examples)
                 response += "\n发送“成语接龙”再开一局。"
@@ -344,7 +344,7 @@ class Plugin:
             title = "全群通关！这局是你们赢了。" if updated.rounds >= updated.goal else "绝杀！这局你们赢了。"
             response = f"{title}\n{chain.current} → {answer}"
             if not verdict.next_idiom and updated.rounds < updated.goal:
-                response += "\n我的常用词池已经找不到能接下去的词，这轮认输。"
+                response += "\n本地词库里找不到还能留出常用接法的词，这轮认输。"
             response += (f"\n本局接对 {updated.rounds}/{updated.goal} 次，{len(scores)} 人参与；"
                          f"你贡献了 {scores[message.sender_id]} 次。\n发送“成语接龙”再开一局。")
         else:

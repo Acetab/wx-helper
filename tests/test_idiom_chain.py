@@ -184,7 +184,7 @@ class IdiomPluginTests(unittest.TestCase):
     def test_correct_prefix_but_not_idiom_reports_failure(self):
         self.start()
         self.ctx.llm.result = {"is_idiom": False, "reason": "这不是成语", "next_idiom": ""}
-        self.send("意料之外", B)
+        self.send("意甲乙丙", B)
         self.assertIn("接龙失败", self.ctx.sent[-1][1])
         self.assertEqual(self.ctx.sent[-1][2:], (B, "小红"))
         self.assertEqual(self.plugin.games[ROOM].chain.current, "一心一意")
@@ -611,7 +611,8 @@ class IdiomPluginTests(unittest.TestCase):
     def test_no_alternative_does_not_spend_swap(self):
         self.start()
         self.send("意气风发")
-        self.send("接龙换题")
+        with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
+            self.send("接龙换题")
         self.assertIn("不扣", self.ctx.sent[-1][1])
         self.assertEqual(self.plugin.games[ROOM].swaps_left, 1)
 
@@ -645,16 +646,18 @@ class IdiomPluginTests(unittest.TestCase):
         self.start()
         self.plugin.games[ROOM].rescues_left = 0
         self.send("意气相投")
-        self.send("好高骛远")  # 投其所好后，“远”无可出题项。
+        with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
+            self.send("好高骛远")  # 显式模拟耗尽，不再假定大词库里“远”字无解。
         self.assertIn("绝杀", self.ctx.sent[-1][1])
-        self.assertIn("常用词池", self.ctx.sent[-1][1])
+        self.assertIn("本地词库", self.ctx.sent[-1][1])
         self.assertNotIn("大家继续接", self.ctx.sent[-1][1])
         self.assertNotIn(ROOM, self.plugin.games)
 
     def test_rescue_restarts_chain_and_keeps_progress(self):
         self.start()
         self.send("意气相投")
-        self.send("好高骛远")  # 该字在词池中无解，触发续接而不是认输。
+        with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
+            self.send("好高骛远")  # 模拟没有合适题目，触发续接而不是认输。
         game = self.plugin.games[ROOM]
         self.assertIn("换个开头", self.ctx.sent[-1][1])
         self.assertEqual(game.rounds, 2)
@@ -688,7 +691,7 @@ class IdiomPluginTests(unittest.TestCase):
         self.start()
         before = self.plugin.games[ROOM]
         with patch.object(self.ctx.llm, "complete_json", side_effect=LLMError("超时")), self.assertLogs("IdiomTests"):
-            self.send("意料之外")
+            self.send("意甲乙丙")
         self.assertEqual(self.plugin.games[ROOM].rounds, before.rounds)
         self.assertEqual(self.plugin.games[ROOM].chain.current, before.chain.current)
         self.assertEqual(self.plugin.games[ROOM].scores, {})
@@ -722,12 +725,28 @@ class IdiomPluginTests(unittest.TestCase):
         self.use_state(state)
         self.start()
         self.send("意气相投")
-        self.send("好高骛远")
+        with patch.object(self.plugin.judge.lexicon, "choose", return_value=""):
+            self.send("好高骛远")
         self.assertEqual(self.plugin.games[ROOM].rescues_left, 2)
         self.use_state(state)
         self.send("接龙状态")
         game = self.plugin.games[ROOM]
         self.assertEqual((game.rounds, game.rescues_left, game.scores), (2, 2, {A: 2}))
+
+    def test_expanded_dictionary_answer_needs_no_model(self):
+        self.start()
+        with patch.object(self.ctx.llm, "complete_json", side_effect=AssertionError("不应调用模型")):
+            self.send("意料之外")
+        self.assertEqual(self.plugin.games[ROOM].rounds, 1)
+
+    def test_old_dictionary_dead_end_can_continue_without_rescue(self):
+        self.start()
+        self.send("意气相投")
+        self.send("好高骛远")
+        game = self.plugin.games[ROOM]
+        self.assertEqual(game.rescues_left, 3)
+        self.assertEqual(game.chain.current[0], "远")
+        self.assertEqual(game.rounds, 2)
 
 
 if __name__ == "__main__":
